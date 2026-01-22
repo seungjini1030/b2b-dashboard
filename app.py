@@ -1,0 +1,863 @@
+# ==========================================
+# B2B 출고 대시보드 (Google Sheet 기반)
+# - Google Sheet(SAP 탭) CSV export 로드 (header=6 = 시트 7행)
+# - 제품분류: B0/B1 고정
+# - 필터: 거래처구분1 / 거래처구분2 / 월(월1) / BP명
+# - 출고건수: 대표행(TRUE) 기준
+# - 리드타임: 작업완료일 기준(리드타임2)
+# - 주차/월 Top10: "해당 주차(또는 월)에서 요청수량 합이 가장 큰 (BP+품목) Top10"
+#   (BP명/품목코드/품목명/요청수량)
+# - ✅ 추가1: 주차/월 "품목 기준" Top5 + 해당 품목의 BP명(복수, BP별 수량 포함)
+# - ✅ 추가2: 전주/전월 대비 +30% 이상 증가 SKU 리포트
+#    (현재 >= 이전 * 1.3) + 리포트에도 "BP명(요청수량)"(복수) 표시
+#    ※ "전주 0 → 이번 주 발생(신규)" 섹션은 제거
+# - ✅ UI 튜닝: 표 가독성(헤더 고정/줄바꿈/컬럼폭/지브라/폰트) + KPI 카드 개선
+# - ✅ 메뉴 순서 변경:
+#   ① 주차 Top10  ② 월 Top10  ③ 국가별 조회(국가 KPI)  ④ BP명별 조회(BP KPI)
+# - ✅ 주차 산정 방식 변경:
+#   - SAP RAW에 '주차' 컬럼이 있으면, 그 값을 기반으로 _week_label 생성(=RAW 기반)
+#   - '주차' 컬럼이 없을 때만 출고일자 기반으로 생성
+# ==========================================
+
+import re
+import streamlit as st
+import pandas as pd
+import html
+
+# =========================
+# 컬럼명 표준화 (RAW 기준)
+# =========================
+COL_QTY = "요청수량"
+COL_YEAR = "년"
+COL_MONTH = "월1"
+COL_WEEK_LABEL = "주차"
+COL_DONE = "작업완료"
+COL_SHIP = "출고일자"
+COL_LT2 = "리드타임2"
+COL_BP = "BP명"
+COL_MAIN = "대표행"
+COL_CUST1 = "거래처구분1"
+COL_CUST2 = "거래처구분2"
+COL_CLASS = "제품분류"
+COL_ITEM_CODE = "품목코드"
+COL_ITEM_NAME = "품목명"
+COL_ORDER_DATE = "발주일자"
+
+KEEP_CLASSES = ["B0", "B1"]
+LT_ONLY_CUST1 = "해외B2B"
+SPIKE_FACTOR = 1.3  # 전주/전월 대비 +30%
+
+# =========================
+# Google Sheet 설정
+# =========================
+GSHEET_ID = "1jbWMgV3fudWCQ1qhG0lCysZGGFCo4loTIf-j3iuaqOI"
+GSHEET_GID = "15468212"
+HEADER_ROW_0BASED = 6
+
+# =========================
+# Streamlit 설정
+# =========================
+st.set_page_config(page_title="B2B 출고 대시보드 (Google Sheet 기반)", layout="wide")
+
+# -------------------------
+# UI Style (✅ 헤더 sticky 안정화 버전)
+# - 핵심: table 자체에 overflow:hidden / border-radius 주지 않기
+# - wrapper(frame)에 border-radius + overflow:hidden 부여
+# -------------------------
+BASE_CSS = """
+<style>
+.block-container {padding-top: 1.2rem; padding-bottom: 2.5rem;}
+h1, h2, h3 {letter-spacing: -0.2px;}
+.small-note {color:#6b7280; font-size: 0.9rem;}
+
+.kpi-wrap {display:flex; gap:0.75rem; flex-wrap:wrap; margin: 0.25rem 0 0.75rem 0;}
+.kpi-card {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 0.9rem 0.95rem;
+  min-width: 180px;
+  flex: 1 1 180px;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+}
+.kpi-title {color:#6b7280; font-size:0.9rem; margin-bottom:0.35rem;}
+.kpi-value {font-size:1.35rem; font-weight:700; color:#111827; line-height:1.2;}
+.kpi-big {font-size:1.55rem; font-weight:800; color:#111827; line-height:1.15;}
+.kpi-muted {color:#6b7280; font-size:0.85rem; margin-top:0.15rem; white-space:normal; word-break:break-word;}
+
+.pretty-table-wrap {margin-top: 0.25rem;}
+
+/* ✅ 프레임(바깥)에서 라운드/클립 처리 */
+.table-frame{
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  overflow: hidden;           /* 여기서만 clip */
+  background: #fff;
+}
+
+/* ✅ 실제 스크롤 컨테이너 (sticky 기준 컨테이너) */
+.table-scroll{
+  height: 520px;              /* 기본값 (render에서 inline으로 override) */
+  overflow: auto;
+  position: relative;
+}
+
+/* ✅ table은 overflow / border-radius 주지 말기 */
+table.pretty-table{
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: #fff;
+  font-size: 0.93rem;
+}
+
+/* ✅ sticky 헤더 */
+.pretty-table thead th{
+  position: -webkit-sticky;
+  position: sticky;
+  top: 0;
+  background: #f9fafb;
+  color: #111827;
+  text-align: left;
+  padding: 10px 10px;
+  border-bottom: 1px solid #e5e7eb;
+  z-index: 10;
+  white-space: nowrap;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.06);
+}
+
+.pretty-table tbody td{
+  padding: 10px 10px;
+  border-bottom: 1px solid #f3f4f6;
+  vertical-align: top;
+}
+
+.pretty-table tbody tr:nth-child(even) td {background: #fcfcfd;}
+.pretty-table tbody tr:hover td {background: #f7fbff;}
+
+.wrap {white-space: normal; word-break: break-word; line-height: 1.25rem;}
+.mono {font-variant-numeric: tabular-nums;}
+
+hr {margin: 1.2rem 0;}
+</style>
+"""
+st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+# -------------------------
+# Utils
+# -------------------------
+def to_bool_true(s: pd.Series) -> pd.Series:
+    x = s.fillna("").astype(str).str.strip().str.upper()
+    return x.isin(["TRUE", "T", "1", "Y", "YES"])
+
+def safe_dt(df: pd.DataFrame, col: str) -> None:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+def safe_num(df: pd.DataFrame, col: str) -> None:
+    if col in df.columns:
+        s = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+        s = s.replace({"": None, "nan": None, "None": None})
+        df[col] = pd.to_numeric(s, errors="coerce")
+
+def uniq_sorted(df: pd.DataFrame, col: str):
+    if col not in df.columns:
+        return []
+    return sorted(df[col].dropna().astype(str).unique().tolist())
+
+def fmt_date(dtval) -> str:
+    if pd.isna(dtval):
+        return "-"
+    return pd.to_datetime(dtval).strftime("%Y-%m-%d")
+
+def need_cols(df: pd.DataFrame, cols: list[str], title: str = "필요 컬럼 누락"):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        st.warning(f"{title}: {missing}")
+        return False
+    return True
+
+def normalize_text_cols(df: pd.DataFrame, cols: list[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+def _escape(x) -> str:
+    if pd.isna(x):
+        return ""
+    return html.escape(str(x))
+
+def render_pretty_table(
+    df: pd.DataFrame,
+    height: int = 520,
+    wrap_cols: list[str] | None = None,
+    col_width_px: dict[str, int] | None = None,
+    number_cols: list[str] | None = None,
+):
+    wrap_cols = wrap_cols or []
+    col_width_px = col_width_px or {}
+    number_cols = number_cols or []
+
+    if df is None or df.empty:
+        st.info("표시할 데이터가 없습니다.")
+        return
+
+    cols = list(df.columns)
+
+    colgroup = "<colgroup>"
+    for c in cols:
+        w = col_width_px.get(c)
+        colgroup += f'<col style="width:{int(w)}px;">' if w else "<col>"
+    colgroup += "</colgroup>"
+
+    thead = "<thead><tr>" + "".join([f"<th>{_escape(c)}</th>" for c in cols]) + "</tr></thead>"
+
+    tbody_rows = []
+    for _, row in df.iterrows():
+        tds = []
+        for c in cols:
+            v = row[c]
+            cls = []
+            if c in wrap_cols:
+                cls.append("wrap")
+            if c in number_cols:
+                cls.append("mono")
+            class_attr = f' class="{" ".join(cls)}"' if cls else ""
+            tds.append(f"<td{class_attr}>{_escape(v)}</td>")
+        tbody_rows.append("<tr>" + "".join(tds) + "</tr>")
+    tbody = "<tbody>" + "".join(tbody_rows) + "</tbody>"
+
+    # ✅ 핵심: frame(라운드/clip) → scroll(overflow) → table(sticky)
+    st.markdown(
+        f"""
+        <div class="pretty-table-wrap">
+          <div class="table-frame">
+            <div class="table-scroll" style="height:{int(height)}px;">
+              <table class="pretty-table">
+                {colgroup}
+                {thead}
+                {tbody}
+              </table>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+# -------------------------
+# Label helpers (RAW 기반)
+# -------------------------
+def make_month_label(year: int, month: int) -> str:
+    return f"{int(year)}년 {int(month)}월"
+
+def build_week_label_from_raw_row(row: pd.Series) -> str | None:
+    """
+    ✅ RAW '주차'를 기반으로 주차 라벨 생성.
+    - RAW 주차 값이 이미 'YYYY년 M월 N주차'면 그대로 사용
+    - 'M월 N주차' 또는 'N주차' 형태면 (년, 월1)과 결합하여 'YYYY년 M월 N주차'
+    - 파싱 실패 시 None 반환(=RAW에 없는 주차를 인위적으로 만들지 않음)
+    """
+    if COL_WEEK_LABEL not in row or pd.isna(row[COL_WEEK_LABEL]):
+        return None
+
+    wk_raw = str(row[COL_WEEK_LABEL]).strip()
+    if wk_raw == "" or wk_raw.lower() == "nan":
+        return None
+
+    if re.search(r"\d{4}\s*년", wk_raw) and ("주차" in wk_raw) and ("월" in wk_raw):
+        return wk_raw.replace("  ", " ").strip()
+
+    m_w = re.search(r"(\d+)\s*주차", wk_raw)
+    if not m_w:
+        return None
+    wk_num = int(m_w.group(1))
+
+    m_m = re.search(r"(\d+)\s*월", wk_raw)
+    if m_m:
+        month_num = int(m_m.group(1))
+    else:
+        if COL_MONTH not in row or pd.isna(row[COL_MONTH]):
+            return None
+        month_num = int(pd.to_numeric(row[COL_MONTH], errors="coerce"))
+
+    if COL_YEAR not in row or pd.isna(row[COL_YEAR]):
+        return None
+    year_num = int(pd.to_numeric(row[COL_YEAR], errors="coerce"))
+
+    if year_num <= 0 or month_num <= 0 or wk_num <= 0:
+        return None
+
+    return f"{year_num}년 {month_num}월 {wk_num}주차"
+
+def parse_week_label_key(label: str) -> tuple[int, int, int]:
+    y = m = w = 0
+    try:
+        my = re.search(r"(\d{4})\s*년", label)
+        mm = re.search(r"(\d+)\s*월", label)
+        mw = re.search(r"(\d+)\s*주차", label)
+        if my: y = int(my.group(1))
+        if mm: m = int(mm.group(1))
+        if mw: w = int(mw.group(1))
+    except Exception:
+        pass
+    return (y, m, w)
+
+def parse_month_label_key(label: str) -> tuple[int, int]:
+    y = m = 0
+    try:
+        my = re.search(r"(\d{4})\s*년", label)
+        mm = re.search(r"(\d+)\s*월", label)
+        if my: y = int(my.group(1))
+        if mm: m = int(mm.group(1))
+    except Exception:
+        pass
+    return (y, m)
+
+# -------------------------
+# BP list helpers
+# -------------------------
+def build_bp_list_map(df_period: pd.DataFrame) -> pd.DataFrame:
+    if df_period.empty:
+        return pd.DataFrame(columns=[COL_ITEM_CODE, COL_ITEM_NAME, "BP명(요청수량)"])
+
+    bp_break = (
+        df_period.groupby([COL_ITEM_CODE, COL_ITEM_NAME, COL_BP], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(columns={COL_QTY: "BP요청수량"})
+    )
+
+    def format_bp_list(sub: pd.DataFrame) -> str:
+        sub = sub.sort_values("BP요청수량", ascending=False, na_position="last")
+        out = []
+        for _, r in sub.iterrows():
+            bp = str(r.get(COL_BP, "")).strip()
+            q = r.get("BP요청수량", 0)
+            if pd.isna(q):
+                q = 0
+            out.append(f"{bp}({int(round(q, 0)):,})")
+        return ", ".join(out)
+
+    return (
+        bp_break.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)
+        .apply(format_bp_list)
+        .reset_index(name="BP명(요청수량)")
+    )
+
+def build_item_top5_with_bp(df_period: pd.DataFrame) -> pd.DataFrame:
+    if df_period.empty:
+        return pd.DataFrame(columns=["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"])
+
+    top5 = (
+        df_period.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(columns={COL_QTY: "요청수량_합"})
+        .sort_values("요청수량_합", ascending=False, na_position="last")
+        .head(5)
+        .copy()
+    )
+
+    bp_map = build_bp_list_map(df_period)
+    top5 = top5.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
+    top5.insert(0, "순위", range(1, len(top5) + 1))
+    top5["요청수량_합"] = top5["요청수량_합"].fillna(0).round(0).astype(int)
+    top5["BP명(요청수량)"] = top5["BP명(요청수량)"].fillna("")
+    return top5[["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"]]
+
+def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ✅ 전주/전월 대비 +30% 이상 증가 SKU만 반환 (신규 발생 제거)
+    + BP명(요청수량) 포함
+    """
+    cols = [COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량", "현재_요청수량", "증가배수", "BP명(요청수량)"]
+    if cur_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    cur_sku = (
+        cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index(name="현재_요청수량")
+    )
+
+    prev_sku = (
+        prev_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index(name="이전_요청수량")
+    ) if not prev_df.empty else pd.DataFrame(columns=[COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량"])
+
+    cmp = cur_sku.merge(prev_sku, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
+    cmp["이전_요청수량"] = cmp["이전_요청수량"].fillna(0)
+
+    cmp["증가배수"] = cmp.apply(
+        lambda r: (r["현재_요청수량"] / r["이전_요청수량"]) if r["이전_요청수량"] > 0 else None,
+        axis=1
+    )
+
+    spike = cmp[(cmp["이전_요청수량"] > 0) & (cmp["현재_요청수량"] >= cmp["이전_요청수량"] * SPIKE_FACTOR)].copy()
+
+    bp_map = build_bp_list_map(cur_df)
+    spike = spike.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
+
+    spike = spike.sort_values("현재_요청수량", ascending=False, na_position="last")
+    spike["현재_요청수량"] = spike["현재_요청수량"].fillna(0).round(0).astype(int)
+    spike["이전_요청수량"] = spike["이전_요청수량"].fillna(0).round(0).astype(int)
+    spike["증가배수"] = spike["증가배수"].round(2)
+    spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
+    return spike[cols]
+
+# -------------------------
+# Load RAW from Google Sheet (CSV export)
+# -------------------------
+@st.cache_data(ttl=300)
+def load_raw_from_gsheet() -> pd.DataFrame:
+    csv_url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/export?format=csv&gid={GSHEET_GID}"
+    df = pd.read_csv(csv_url, header=HEADER_ROW_0BASED)
+
+    df.columns = df.columns.astype(str).str.strip()
+    df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
+
+    for c in [COL_SHIP, COL_DONE, COL_ORDER_DATE]:
+        safe_dt(df, c)
+
+    for c in [COL_QTY, COL_LT2, "리드타임1"]:
+        safe_num(df, c)
+
+    if (COL_LT2 not in df.columns) or (df[COL_LT2].dropna().empty):
+        if all(c in df.columns for c in [COL_DONE, COL_ORDER_DATE]):
+            df[COL_LT2] = (df[COL_DONE] - df[COL_ORDER_DATE]).dt.days
+            safe_num(df, COL_LT2)
+
+    normalize_text_cols(
+        df,
+        [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_WEEK_LABEL, COL_CLASS, COL_MAIN]
+    )
+
+    if COL_MAIN in df.columns:
+        df["_is_rep"] = to_bool_true(df[COL_MAIN])
+    else:
+        df["_is_rep"] = False
+
+    if COL_WEEK_LABEL in df.columns and df[COL_WEEK_LABEL].astype(str).str.strip().replace("nan", "").ne("").any():
+        df["_week_label"] = df.apply(build_week_label_from_raw_row, axis=1)
+    else:
+        def make_week_label_from_shipdate(ship_date: pd.Timestamp) -> str | None:
+            if pd.isna(ship_date):
+                return None
+            y = int(ship_date.year)
+            m = int(ship_date.month)
+            d = int(ship_date.day)
+            wk = (d - 1) // 7 + 1
+            return f"{y}년 {m}월 {wk}주차"
+
+        df["_week_label"] = df[COL_SHIP].apply(make_week_label_from_shipdate) if COL_SHIP in df.columns else None
+
+    if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
+        y = pd.to_numeric(df[COL_YEAR], errors="coerce")
+        m = pd.to_numeric(df[COL_MONTH], errors="coerce")
+        df["_month_label"] = [
+            make_month_label(yy, mm) if pd.notna(yy) and pd.notna(mm) else None
+            for yy, mm in zip(y, m)
+        ]
+    else:
+        df["_month_label"] = None
+
+    return df
+
+# -------------------------
+# Main
+# -------------------------
+st.title("📦 B2B 출고 대시보드")
+st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
+
+if st.button("🔄 데이터 새로고침"):
+    st.cache_data.clear()
+    st.rerun()
+
+try:
+    raw = load_raw_from_gsheet().copy()
+except Exception as e:
+    st.error("Google Sheet에서 RAW 데이터를 불러오지 못했습니다.")
+    st.code(str(e))
+    st.stop()
+
+# 제품분류 B0/B1 고정
+if COL_CLASS in raw.columns:
+    raw = raw[raw[COL_CLASS].astype(str).str.strip().isin(KEEP_CLASSES)].copy()
+else:
+    st.warning(f"'{COL_CLASS}' 컬럼이 없어 제품분류(B0/B1) 고정 필터를 적용할 수 없습니다.")
+
+# =========================
+# Sidebar filters (cascading)
+# =========================
+st.sidebar.header("필터")
+st.sidebar.caption("제품분류 고정: B0, B1")
+
+cust1_list = uniq_sorted(raw, COL_CUST1)
+sel_cust1 = st.sidebar.selectbox("거래처구분1", ["전체"] + cust1_list, index=0, key="f_cust1")
+
+pool1 = raw.copy()
+if sel_cust1 != "전체" and COL_CUST1 in pool1.columns:
+    pool1 = pool1[pool1[COL_CUST1].astype(str).str.strip() == sel_cust1]
+
+cust2_list = uniq_sorted(pool1, COL_CUST2)
+sel_cust2 = st.sidebar.selectbox("거래처구분2", ["전체"] + cust2_list, index=0, key="f_cust2")
+
+pool2 = pool1.copy()
+if sel_cust2 != "전체" and COL_CUST2 in pool2.columns:
+    pool2 = pool2[pool2[COL_CUST2].astype(str).str.strip() == sel_cust2]
+
+months = []
+if COL_MONTH in pool2.columns:
+    mnum = pd.to_numeric(pool2[COL_MONTH], errors="coerce").dropna().astype(int)
+    months = sorted(mnum.unique().tolist())
+sel_month = st.sidebar.selectbox("월", ["전체"] + [f"{m}월" for m in months], index=0, key="f_month")
+
+pool3 = pool2.copy()
+if sel_month != "전체" and COL_MONTH in pool3.columns:
+    m_int = int(str(sel_month).replace("월", "").strip())
+    pool3 = pool3[pd.to_numeric(pool3[COL_MONTH], errors="coerce") == m_int]
+
+bp_list = uniq_sorted(pool3, COL_BP)
+sel_bp = st.sidebar.selectbox("BP명", ["전체"] + bp_list, index=0, key="f_bp")
+
+df_view = pool3.copy()
+if sel_bp != "전체" and COL_BP in df_view.columns:
+    df_view = df_view[df_view[COL_BP].astype(str).str.strip() == sel_bp]
+
+df_rep = df_view[df_view["_is_rep"]].copy()
+
+# =========================
+# KPI cards
+# =========================
+total_qty = df_view[COL_QTY].fillna(0).sum() if COL_QTY in df_view.columns else None
+total_cnt = int(df_rep.shape[0])
+latest_done = df_view[COL_DONE].max() if COL_DONE in df_view.columns else None
+
+avg_lt2_overseas = None
+if all(c in df_view.columns for c in [COL_CUST1, COL_LT2]):
+    overseas = df_view[df_view[COL_CUST1].astype(str).str.strip() == LT_ONLY_CUST1]
+    if not overseas.empty and not overseas[COL_LT2].dropna().empty:
+        avg_lt2_overseas = float(overseas[COL_LT2].dropna().mean())
+
+top_bp_qty_name = "-"
+top_bp_qty_val = "-"
+if all(c in df_view.columns for c in [COL_BP, COL_QTY]) and not df_view.empty:
+    g = df_view.groupby(COL_BP, dropna=False)[COL_QTY].sum().sort_values(ascending=False)
+    if not g.empty:
+        top_bp_qty_name = str(g.index[0])
+        top_bp_qty_val = f"{float(g.iloc[0]):,.0f}"
+
+top_bp_cnt_name = "-"
+top_bp_cnt_val = "-"
+if COL_BP in df_rep.columns and not df_rep.empty:
+    g2 = df_rep.groupby(COL_BP).size().sort_values(ascending=False)
+    if not g2.empty:
+        top_bp_cnt_name = str(g2.index[0])
+        top_bp_cnt_val = f"{int(g2.iloc[0]):,}"
+
+st.markdown(
+    f"""
+    <div class="kpi-wrap">
+      <div class="kpi-card">
+        <div class="kpi-title">총 출고수량(합)</div>
+        <div class="kpi-value">{(f"{total_qty:,.0f}" if total_qty is not None else "-")}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">총 출고건수(합)</div>
+        <div class="kpi-value">{total_cnt:,}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">최근 작업완료일</div>
+        <div class="kpi-value">{fmt_date(latest_done)}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">리드타임2 평균 (해외B2B)</div>
+        <div class="kpi-value">{(f"{avg_lt2_overseas:.1f}일" if avg_lt2_overseas is not None else "-")}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">출고수량 TOP BP</div>
+        <div class="kpi-big">{html.escape(top_bp_qty_val)}</div>
+        <div class="kpi-muted">{html.escape(top_bp_qty_name)}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">출고건수 TOP BP</div>
+        <div class="kpi-big">{html.escape(top_bp_cnt_val)}</div>
+        <div class="kpi-muted">{html.escape(top_bp_cnt_name)}</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만을 대상으로 계산됩니다.")
+st.divider()
+
+# =========================
+# Navigation (순서/명칭 변경)
+# =========================
+nav = st.radio(
+    "메뉴",
+    ["① 주차 Top10", "② 월 Top10", "③ 국가별 조회", "④ BP명별 조회"],
+    horizontal=True,
+    key="nav_menu"
+)
+
+# =========================
+# ① 주차 Top10
+# =========================
+if nav == "① 주차 Top10":
+    st.subheader("주차 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
+
+    d = df_view.copy()
+    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "주차 Top10"):
+        st.stop()
+
+    week_list = [x for x in d["_week_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
+    week_list = sorted(week_list, key=parse_week_label_key)
+
+    if not week_list:
+        st.info("주차 목록이 없습니다. (RAW의 '주차' 값이 비어있거나 컬럼이 없는지 확인)")
+        st.stop()
+
+    sel_week = st.selectbox("주차 선택", week_list, index=len(week_list) - 1, key="wk_sel_week")
+    wdf = d[d["_week_label"].astype(str) == str(sel_week)].copy()
+
+    top10 = (
+        wdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .sort_values(COL_QTY, ascending=False, na_position="last")
+        .head(10)
+        .copy()
+    )
+    top10.insert(0, "순위", range(1, len(top10) + 1))
+    top10[COL_QTY] = top10[COL_QTY].fillna(0).round(0).astype(int)
+
+    render_pretty_table(
+        top10,
+        height=420,
+        wrap_cols=[COL_BP, COL_ITEM_NAME],
+        col_width_px={"순위": 60, COL_BP: 240, COL_ITEM_CODE: 120, COL_ITEM_NAME: 360, COL_QTY: 120},
+        number_cols=[COL_QTY],
+    )
+    st.caption("※ Top10은 선택 주차 내 ‘요청수량 합’ 기준으로 가장 많이 출고된 (BP+품목) 10개입니다.")
+
+    st.divider()
+
+    st.subheader("주차 선택 → 품목 Top 5 (품목 기준) + BP명(복수)")
+    top5_item = build_item_top5_with_bp(wdf)
+
+    render_pretty_table(
+        top5_item,
+        height=360,
+        wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+        col_width_px={"순위": 60, COL_ITEM_CODE: 130, COL_ITEM_NAME: 360, "요청수량_합": 120, "BP명(요청수량)": 520},
+        number_cols=["요청수량_합"],
+    )
+    st.caption("※ 품목 Top5는 선택 주차 내 ‘품목 기준 요청수량 합’ TOP5이며, BP명은 해당 품목에 포함된 BP를 (BP별 수량)과 함께 나열합니다.")
+
+    st.divider()
+
+    st.subheader("전주 대비 급증 SKU 리포트 (+30% 이상 증가)")
+    cur_idx = week_list.index(sel_week) if sel_week in week_list else None
+    if cur_idx is None or cur_idx == 0:
+        st.info("전주 비교를 위해서는 선택 주차 이전의 주차 데이터가 필요합니다.")
+    else:
+        prev_week = week_list[cur_idx - 1]
+        prev_wdf = d[d["_week_label"].astype(str) == str(prev_week)].copy()
+
+        spike_df = build_spike_report_only(wdf, prev_wdf)
+
+        st.caption(
+            f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week}) | "
+            f"급증 정의: 현재 요청수량 ≥ 전주 요청수량 × {SPIKE_FACTOR} (전주 대비 +30% 이상 증가)"
+        )
+
+        render_pretty_table(
+            spike_df,
+            height=520,
+            wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+            col_width_px={
+                COL_ITEM_CODE: 130, COL_ITEM_NAME: 360,
+                "이전_요청수량": 120, "현재_요청수량": 120,
+                "증가배수": 90, "BP명(요청수량)": 520
+            },
+            number_cols=["이전_요청수량", "현재_요청수량", "증가배수"],
+        )
+
+# =========================
+# ② 월 Top10
+# =========================
+elif nav == "② 월 Top10":
+    st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
+
+    d = df_view.copy()
+    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "월 Top10"):
+        st.stop()
+
+    month_list = [x for x in d["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
+    month_list = list(dict.fromkeys(month_list))
+    month_list = sorted(month_list, key=parse_month_label_key)
+
+    if not month_list:
+        st.info("월 목록이 없습니다. RAW의 '년', '월1' 컬럼을 확인해 주세요.")
+        st.stop()
+
+    sel_month_label = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
+    mdf = d[d["_month_label"].astype(str) == str(sel_month_label)].copy()
+
+    top10 = (
+        mdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .sort_values(COL_QTY, ascending=False, na_position="last")
+        .head(10)
+        .copy()
+    )
+    top10.insert(0, "순위", range(1, len(top10) + 1))
+    top10[COL_QTY] = top10[COL_QTY].fillna(0).round(0).astype(int)
+
+    render_pretty_table(
+        top10,
+        height=420,
+        wrap_cols=[COL_BP, COL_ITEM_NAME],
+        col_width_px={"순위": 60, COL_BP: 240, COL_ITEM_CODE: 120, COL_ITEM_NAME: 360, COL_QTY: 120},
+        number_cols=[COL_QTY],
+    )
+    st.caption("※ Top10은 선택 월 내에서 ‘요청수량 합’ 기준으로 가장 많이 출고된 (BP+품목) 10개입니다.")
+
+    st.divider()
+
+    st.subheader("월 선택 → 품목 Top 5 (품목 기준) + BP명(복수)")
+    top5_item = build_item_top5_with_bp(mdf)
+
+    render_pretty_table(
+        top5_item,
+        height=360,
+        wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+        col_width_px={"순위": 60, COL_ITEM_CODE: 130, COL_ITEM_NAME: 360, "요청수량_합": 120, "BP명(요청수량)": 520},
+        number_cols=["요청수량_합"],
+    )
+    st.caption("※ 품목 Top5는 선택 월 내 ‘품목 기준 요청수량 합’ TOP5이며, BP명은 해당 품목에 포함된 BP를 (BP별 수량)과 함께 나열합니다.")
+
+    st.divider()
+
+    st.subheader("전월 대비 급증 SKU 리포트 (+30% 이상 증가)")
+    cur_idx = month_list.index(sel_month_label) if sel_month_label in month_list else None
+    if cur_idx is None or cur_idx == 0:
+        st.info("전월 비교를 위해서는 선택 월 이전의 월 데이터가 필요합니다.")
+    else:
+        prev_month_label = month_list[cur_idx - 1]
+        prev_mdf = d[d["_month_label"].astype(str) == str(prev_month_label)].copy()
+
+        spike_df = build_spike_report_only(mdf, prev_mdf)
+
+        st.caption(
+            f"※ 비교 기준: 선택 월({sel_month_label}) vs 전월({prev_month_label}) | "
+            f"급증 정의: 현재 요청수량 ≥ 전월 요청수량 × {SPIKE_FACTOR} (전월 대비 +30% 이상 증가)"
+        )
+
+        render_pretty_table(
+            spike_df,
+            height=520,
+            wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+            col_width_px={
+                COL_ITEM_CODE: 130, COL_ITEM_NAME: 360,
+                "이전_요청수량": 120, "현재_요청수량": 120,
+                "증가배수": 90, "BP명(요청수량)": 520
+            },
+            number_cols=["이전_요청수량", "현재_요청수량", "증가배수"],
+        )
+
+# =========================
+# ③ 국가별 조회 (국가 KPI)
+# =========================
+elif nav == "③ 국가별 조회":
+    st.subheader("국가별 조회 (거래처구분2 기준)")
+
+    if not need_cols(df_view, [COL_CUST2, COL_QTY, COL_LT2], "국가별 조회"):
+        st.stop()
+
+    base = df_view.copy()
+
+    out = base.groupby(COL_CUST2, dropna=False).agg(
+        요청수량_합=(COL_QTY, "sum"),
+        평균_리드타임_작업완료기준=(COL_LT2, "mean"),
+        리드타임_중간값_작업완료기준=(COL_LT2, "median"),
+        p90_tmp=(COL_LT2, lambda s: s.quantile(0.9)),
+        집계행수_표본=(COL_CUST2, "size"),
+    ).reset_index()
+
+    out = out.rename(columns={"p90_tmp": "리드타임 느린 상위10% 기준(P90)"})
+
+    rep_cnt = base[base["_is_rep"]].groupby(COL_CUST2).size()
+    out["출고건수"] = out[COL_CUST2].astype(str).map(rep_cnt).fillna(0).astype(int)
+
+    out = out[
+        [COL_CUST2, "요청수량_합", "평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준",
+         "리드타임 느린 상위10% 기준(P90)", "출고건수", "집계행수_표본"]
+    ]
+
+    for c in ["평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준", "리드타임 느린 상위10% 기준(P90)"]:
+        out[c] = out[c].round(2)
+
+    out = out.sort_values("요청수량_합", ascending=False, na_position="last")
+
+    render_pretty_table(
+        out,
+        height=520,
+        wrap_cols=[COL_CUST2],
+        col_width_px={COL_CUST2: 200, "요청수량_합": 120, "출고건수": 90, "집계행수_표본": 110},
+        number_cols=["요청수량_합", "출고건수", "집계행수_표본"],
+    )
+    st.caption("※ P90은 ‘느린 상위 10%’ 경계값(리드타임이 큰 구간)입니다.")
+
+# =========================
+# ④ BP명별 조회 (BP KPI)
+# =========================
+elif nav == "④ BP명별 조회":
+    st.subheader("BP명별 조회")
+
+    if not need_cols(df_view, [COL_BP, COL_QTY, COL_LT2], "BP명별 조회"):
+        st.stop()
+
+    base = df_view.copy()
+
+    out = base.groupby(COL_BP, dropna=False).agg(
+        요청수량_합=(COL_QTY, "sum"),
+        평균_리드타임_작업완료기준=(COL_LT2, "mean"),
+        리드타임_중간값_작업완료기준=(COL_LT2, "median"),
+        최근_출고일=(COL_SHIP, "max"),
+        최근_작업완료일=(COL_DONE, "max"),
+        집계행수_표본=(COL_BP, "size"),
+    ).reset_index()
+
+    rep_cnt = base[base["_is_rep"]].groupby(COL_BP).size()
+    out["출고건수"] = out[COL_BP].astype(str).map(rep_cnt).fillna(0).astype(int)
+
+    out["최근_출고일"] = out["최근_출고일"].apply(fmt_date)
+    out["최근_작업완료일"] = out["최근_작업완료일"].apply(fmt_date)
+
+    for c in ["평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준"]:
+        out[c] = out[c].round(2)
+
+    out = out[
+        [COL_BP, "요청수량_합", "평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준",
+         "최근_출고일", "최근_작업완료일", "출고건수", "집계행수_표본"]
+    ].sort_values("요청수량_합", ascending=False, na_position="last")
+
+    render_pretty_table(
+        out,
+        height=520,
+        wrap_cols=[COL_BP],
+        col_width_px={COL_BP: 280, "요청수량_합": 120, "출고건수": 90, "집계행수_표본": 110},
+        number_cols=["요청수량_합", "출고건수", "집계행수_표본"],
+    )
+
+# =========================
+# Footer
+# =========================
+st.caption(
+    "※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터(거래처구분1/2/월/BP) 범위 내에서 계산됩니다."
+)
