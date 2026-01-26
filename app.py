@@ -1,26 +1,5 @@
 # ==========================================
 # B2B 출고 대시보드 (Google Sheet 기반)
-# - Google Sheet(SAP 탭) CSV export 로드 (header=6 = 시트 7행)
-# - 제품분류: B0/B1 고정
-# - 필터: 거래처구분1 / 거래처구분2 / 월(월1) / BP명
-# - 출고건수: 대표행(TRUE) 기준
-# - 리드타임: 작업완료일 기준(리드타임2)
-# - 주차/월 Top10: "해당 주차(또는 월)에서 요청수량 합이 가장 큰 (BP+품목) Top10"
-#   (BP명/품목코드/품목명/요청수량)
-# - ✅ 추가1: 주차/월 "품목 기준" Top5 + 해당 품목의 BP명(복수, BP별 수량 포함)
-# - ✅ 추가2: 전주/전월 대비 +30% 이상 증가 SKU 리포트
-#    (현재 >= 이전 * 1.3) + 리포트에도 "BP명(요청수량)"(복수) 표시
-#    ※ "전주 0 → 이번 주 발생(신규)" 섹션은 제거
-# - ✅ UI 튜닝: 표 가독성(헤더 고정/줄바꿈/컬럼폭/지브라/폰트) + KPI 카드 개선
-# - ✅ 메뉴 순서 변경:
-#   ① 주차 Top10  ② 월 Top10  ③ 국가별 조회(국가 KPI)  ④ BP명별 조회(BP KPI)  ⑤ SKU별 조회
-# - ✅ 주차 산정 방식 변경:
-#   - SAP RAW에 '주차' 컬럼이 있으면, 그 값을 기반으로 _week_label 생성(=RAW 기반)
-#   - '주차' 컬럼이 없을 때만 출고일자 기반으로 생성
-# - ✅ 추가3: SKU별 조회
-#   - 드롭다운에서 "품목코드 / 품목명" 함께 표시
-#   - 품목코드/품목명/출고예정일(=출고일자, 공백이면 미정)/BP명/요청수량
-#   - BP명이 여러개면 BP명별로 행 분리(요청수량 합계)
 # ==========================================
 
 import re
@@ -64,7 +43,7 @@ HEADER_ROW_0BASED = 6
 st.set_page_config(page_title="B2B 출고 대시보드 (Google Sheet 기반)", layout="wide")
 
 # -------------------------
-# UI Style (✅ 헤더 sticky 안정화 버전)
+# UI Style
 # -------------------------
 BASE_CSS = """
 <style>
@@ -88,23 +67,17 @@ h1, h2, h3 {letter-spacing: -0.2px;}
 .kpi-muted {color:#6b7280; font-size:0.85rem; margin-top:0.15rem; white-space:normal; word-break:break-word;}
 
 .pretty-table-wrap {margin-top: 0.25rem;}
-
-/* ✅ 프레임(바깥)에서 라운드/클립 처리 */
 .table-frame{
   border: 1px solid #e5e7eb;
   border-radius: 14px;
-  overflow: hidden;           /* 여기서만 clip */
+  overflow: hidden;
   background: #fff;
 }
-
-/* ✅ 실제 스크롤 컨테이너 (sticky 기준 컨테이너) */
 .table-scroll{
-  height: 520px;              /* 기본값 (render에서 inline으로 override) */
+  height: 520px;
   overflow: auto;
   position: relative;
 }
-
-/* ✅ table은 overflow / border-radius 주지 말기 */
 table.pretty-table{
   width: 100%;
   border-collapse: separate;
@@ -112,8 +85,6 @@ table.pretty-table{
   background: #fff;
   font-size: 0.93rem;
 }
-
-/* ✅ sticky 헤더 */
 .pretty-table thead th{
   position: -webkit-sticky;
   position: sticky;
@@ -127,19 +98,15 @@ table.pretty-table{
   white-space: nowrap;
   box-shadow: 0 1px 0 rgba(0,0,0,0.06);
 }
-
 .pretty-table tbody td{
   padding: 10px 10px;
   border-bottom: 1px solid #f3f4f6;
   vertical-align: top;
 }
-
 .pretty-table tbody tr:nth-child(even) td {background: #fcfcfd;}
 .pretty-table tbody tr:hover td {background: #f7fbff;}
-
 .wrap {white-space: normal; word-break: break-word; line-height: 1.25rem;}
 .mono {font-variant-numeric: tabular-nums;}
-
 hr {margin: 1.2rem 0;}
 </style>
 """
@@ -253,12 +220,6 @@ def make_month_label(year: int, month: int) -> str:
     return f"{int(year)}년 {int(month)}월"
 
 def build_week_label_from_raw_row(row: pd.Series) -> str | None:
-    """
-    ✅ RAW '주차'를 기반으로 주차 라벨 생성.
-    - RAW 주차 값이 이미 'YYYY년 M월 N주차'면 그대로 사용
-    - 'M월 N주차' 또는 'N주차' 형태면 (년, 월1)과 결합하여 'YYYY년 M월 N주차'
-    - 파싱 실패 시 None 반환(=RAW에 없는 주차를 인위적으로 만들지 않음)
-    """
     if COL_WEEK_LABEL not in row or pd.isna(row[COL_WEEK_LABEL]):
         return None
 
@@ -368,10 +329,6 @@ def build_item_top5_with_bp(df_period: pd.DataFrame) -> pd.DataFrame:
     return top5[["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"]]
 
 def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ 전주/전월 대비 +30% 이상 증가 SKU만 반환 (신규 발생 제거)
-    + BP명(요청수량) 포함
-    """
     cols = [COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량", "현재_요청수량", "증가배수", "BP명(요청수량)"]
     if cur_df.empty:
         return pd.DataFrame(columns=cols)
@@ -451,7 +408,6 @@ def load_raw_from_gsheet() -> pd.DataFrame:
             d = int(ship_date.day)
             wk = (d - 1) // 7 + 1
             return f"{y}년 {m}월 {wk}주차"
-
         df["_week_label"] = df[COL_SHIP].apply(make_week_label_from_shipdate) if COL_SHIP in df.columns else None
 
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
@@ -595,7 +551,7 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation (순서/명칭 변경 + ⑤ SKU별 조회 추가)
+# Navigation (⑤ SKU별 조회 추가)
 # =========================
 nav = st.radio(
     "메뉴",
@@ -857,7 +813,7 @@ elif nav == "④ BP명별 조회":
     )
 
 # =========================
-# ⑤ SKU별 조회
+# ⑤ SKU별 조회 (✅ 품목코드 입력 검색)
 # =========================
 elif nav == "⑤ SKU별 조회":
     st.subheader("SKU별 조회")
@@ -866,58 +822,92 @@ elif nav == "⑤ SKU별 조회":
         st.stop()
 
     base = df_view.copy()
+    base[COL_ITEM_CODE] = base[COL_ITEM_CODE].astype(str).str.strip()
+    base[COL_ITEM_NAME] = base[COL_ITEM_NAME].astype(str).str.strip()
 
-    # ✅ 품목코드별 대표 품목명 매핑(중복이면 첫 값)
-    sku_master = base[[COL_ITEM_CODE, COL_ITEM_NAME]].dropna(subset=[COL_ITEM_CODE]).copy()
-    sku_master[COL_ITEM_CODE] = sku_master[COL_ITEM_CODE].astype(str).str.strip()
-    sku_master[COL_ITEM_NAME] = sku_master[COL_ITEM_NAME].astype(str).str.strip()
+    # 검색 입력
+    q = st.text_input("품목코드 검색 (예: B5SN005A1)", value="", placeholder="품목코드를 입력하세요")
 
-    code_to_name = (
-        sku_master.drop_duplicates(subset=[COL_ITEM_CODE])
-        .set_index(COL_ITEM_CODE)[COL_ITEM_NAME]
-        .to_dict()
-    )
-
-    sku_codes = sorted(code_to_name.keys())
-    if not sku_codes:
-        st.info("현재 필터 조건에서 조회 가능한 품목코드가 없습니다.")
+    if not q.strip():
+        st.info("상단에 품목코드를 입력하면, 해당 SKU의 출고일자/BP명/요청수량이 표시됩니다.")
         st.stop()
 
-    # ✅ 드롭다운에 '품목코드 / 품목명' 같이 표시
-    selected_code = st.selectbox(
-        "품목코드 선택",
-        sku_codes,
-        index=0,
-        format_func=lambda x: f"{x} / {code_to_name.get(x, '')}".strip()
+    q_norm = q.strip().upper()
+
+    # 부분검색 후보
+    candidates = (
+        base[base[COL_ITEM_CODE].str.upper().str.contains(re.escape(q_norm), na=False)][[COL_ITEM_CODE, COL_ITEM_NAME]]
+        .dropna(subset=[COL_ITEM_CODE])
+        .drop_duplicates(subset=[COL_ITEM_CODE])
+        .sort_values(COL_ITEM_CODE)
+        .reset_index(drop=True)
     )
+
+    if candidates.empty:
+        st.warning("해당 품목코드가 현재 필터 범위에서 조회되지 않습니다.")
+        st.stop()
+
+    # 후보가 여러 개면 선택
+    if len(candidates) > 1:
+        cand_map = dict(zip(candidates[COL_ITEM_CODE], candidates[COL_ITEM_NAME]))
+        sel_code = st.selectbox(
+            "검색 결과에서 선택",
+            candidates[COL_ITEM_CODE].tolist(),
+            format_func=lambda x: f"{x} / {cand_map.get(x, '')}".strip()
+        )
+    else:
+        sel_code = candidates.iloc[0][COL_ITEM_CODE]
 
     # 선택 SKU 데이터
-    d = base[base[COL_ITEM_CODE].astype(str).str.strip() == str(selected_code).strip()].copy()
+    d = base[base[COL_ITEM_CODE] == sel_code].copy()
 
-    # 출고예정일(=출고일자) 공백이면 '미정'
+    # 대표 품목명(첫 값)
+    item_name = "-"
+    nn = d[COL_ITEM_NAME].dropna()
+    if not nn.empty:
+        item_name = str(nn.iloc[0]).strip()
+
+    st.markdown(f"- **품목코드:** {html.escape(sel_code)}")
+    st.markdown(f"- **품목명:** {html.escape(item_name)}")
+
+    # 출고일자 공백 -> 미정 (datetime NaT 포함)
     d[COL_SHIP] = d[COL_SHIP].replace("", pd.NA)
-    d["출고예정일"] = d[COL_SHIP].apply(lambda x: "미정" if pd.isna(x) else fmt_date(x))
 
-    # BP명별 요청수량 합계로 행 분리
+    def ship_to_label(x):
+        if pd.isna(x):
+            return "미정"
+        return fmt_date(x)
+
+    d["출고예정일"] = d[COL_SHIP].apply(ship_to_label)
+
+    # ✅ 원하는 결과: 출고일자 / BP명 / 요청수량 (BP 여러개면 행 분리 + 합)
     out = (
-        d.groupby([COL_ITEM_CODE, COL_ITEM_NAME, "출고예정일", COL_BP], dropna=False)[COL_QTY]
+        d.groupby(["출고예정일", COL_BP], dropna=False)[COL_QTY]
         .sum(min_count=1)
         .reset_index()
-        .rename(columns={
-            COL_ITEM_CODE: "품목코드",
-            COL_ITEM_NAME: "품목명",
-            COL_BP: "출고업체(BP명)",
-            COL_QTY: "요청수량"
-        })
+        .rename(columns={COL_BP: "BP명", COL_QTY: "요청수량"})
     )
-
     out["요청수량"] = out["요청수량"].fillna(0).round(0).astype(int)
-    out = out.sort_values(["출고예정일", "요청수량"], ascending=[True, False], na_position="last")
 
-    # 상단 요약
-    st.markdown(
-        f"- **품목코드:** {html.escape(str(selected_code))}\n"
-        f"- **품목명:** {html.escape(code_to_name.get(str(selected_code), ''))}"
+    # 정렬: 미정은 아래로 보내고, 날짜는 오름차순 / 요청수량은 내림차순
+    out["_sort_date"] = pd.to_datetime(out["출고예정일"], errors="coerce")
+    out = out.sort_values(
+        by=["_sort_date", "출고예정일", "요청수량"],
+        ascending=[True, True, False],
+        na_position="last"
+    ).drop(columns=["_sort_date"])
+
+    render_pretty_table(
+        out[["출고예정일", "BP명", "요청수량"]],
+        height=520,
+        wrap_cols=["BP명"],
+        col_width_px={"출고예정일": 140, "BP명": 360, "요청수량": 120},
+        number_cols=["요청수량"],
     )
 
-    render
+# =========================
+# Footer
+# =========================
+st.caption(
+    "※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터(거래처구분1/2/월/BP) 범위 내에서 계산됩니다."
+)
