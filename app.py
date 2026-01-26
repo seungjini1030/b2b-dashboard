@@ -6,6 +6,7 @@ import re
 import streamlit as st
 import pandas as pd
 import html
+from datetime import date
 
 # =========================
 # 컬럼명 표준화 (RAW 기준)
@@ -15,7 +16,7 @@ COL_YEAR = "년"
 COL_MONTH = "월1"
 COL_WEEK_LABEL = "주차"
 COL_DONE = "작업완료"
-COL_SHIP = "출고일자"
+COL_SHIP = "출고일자"          # ✅ SKU조회에서 '출고예정일'로 표시(공백=미정)
 COL_LT2 = "리드타임2"
 COL_BP = "BP명"
 COL_MAIN = "대표행"
@@ -156,6 +157,24 @@ def _escape(x) -> str:
         return ""
     return html.escape(str(x))
 
+def _fmt_num_for_table(v) -> str:
+    """숫자면 천단위 콤마(필요 시 소수 2자리), 아니면 문자열"""
+    if pd.isna(v):
+        return ""
+    try:
+        if isinstance(v, (int,)) and not isinstance(v, bool):
+            return f"{v:,}"
+        if isinstance(v, float):
+            if float(v).is_integer():
+                return f"{int(v):,}"
+            return f"{v:,.2f}"
+        vv = float(v)
+        if vv.is_integer():
+            return f"{int(vv):,}"
+        return f"{vv:,.2f}"
+    except Exception:
+        return str(v)
+
 def render_pretty_table(
     df: pd.DataFrame,
     height: int = 520,
@@ -191,8 +210,11 @@ def render_pretty_table(
                 cls.append("wrap")
             if c in number_cols:
                 cls.append("mono")
+                v_disp = _fmt_num_for_table(v)  # ✅ 콤마 포맷
+            else:
+                v_disp = "" if pd.isna(v) else str(v)
             class_attr = f' class="{" ".join(cls)}"' if cls else ""
-            tds.append(f"<td{class_attr}>{_escape(v)}</td>")
+            tds.append(f"<td{class_attr}>{_escape(v_disp)}</td>")
         tbody_rows.append("<tr>" + "".join(tds) + "</tr>")
     tbody = "<tbody>" + "".join(tbody_rows) + "</tbody>"
 
@@ -410,6 +432,7 @@ def load_raw_from_gsheet() -> pd.DataFrame:
             return f"{y}년 {m}월 {wk}주차"
         df["_week_label"] = df[COL_SHIP].apply(make_week_label_from_shipdate) if COL_SHIP in df.columns else None
 
+    # ✅ year+month 라벨 생성: 2025년 11월 / 2026년 1월
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce")
@@ -428,8 +451,20 @@ def load_raw_from_gsheet() -> pd.DataFrame:
 st.title("📦 B2B 출고 대시보드")
 st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
 
+# ✅ 새로고침: 캐시 + 메뉴/화면 상태 리셋
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
+
+    reset_keys = [
+        "nav_menu", "wk_sel_week", "m_sel_month",
+        "sku_query", "sku_candidate_pick", "sku_show_all_history",
+        "f_cust1", "f_cust2", "f_month", "f_bp"
+    ]
+    for k in reset_keys:
+        if k in st.session_state:
+            del st.session_state[k]
+
+    st.session_state["nav_menu"] = "① 주차 Top10"
     st.rerun()
 
 try:
@@ -465,16 +500,26 @@ pool2 = pool1.copy()
 if sel_cust2 != "전체" and COL_CUST2 in pool2.columns:
     pool2 = pool2[pool2[COL_CUST2].astype(str).str.strip() == sel_cust2]
 
-months = []
-if COL_MONTH in pool2.columns:
-    mnum = pd.to_numeric(pool2[COL_MONTH], errors="coerce").dropna().astype(int)
-    months = sorted(mnum.unique().tolist())
-sel_month = st.sidebar.selectbox("월", ["전체"] + [f"{m}월" for m in months], index=0, key="f_month")
+# ✅ 월 필터: "년+월"로 표시 (2025년 11월 / 2026년 1월)
+month_labels = []
+if "_month_label" in pool2.columns:
+    month_labels = [x for x in pool2["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
+    month_labels = list(dict.fromkeys(month_labels))
+    month_labels = sorted(month_labels, key=parse_month_label_key)
+
+sel_month_label = st.sidebar.selectbox("월", ["전체"] + month_labels, index=0, key="f_month")
 
 pool3 = pool2.copy()
-if sel_month != "전체" and COL_MONTH in pool3.columns:
-    m_int = int(str(sel_month).replace("월", "").strip())
-    pool3 = pool3[pd.to_numeric(pool3[COL_MONTH], errors="coerce") == m_int]
+if sel_month_label != "전체":
+    if "_month_label" in pool3.columns:
+        pool3 = pool3[pool3["_month_label"].astype(str) == str(sel_month_label)]
+    else:
+        # fallback(거의 안 탐): _month_label 없으면 기존 월1 숫자 방식
+        try:
+            m_int = int(str(sel_month_label).replace("월", "").strip())
+            pool3 = pool3[pd.to_numeric(pool3[COL_MONTH], errors="coerce") == m_int]
+        except Exception:
+            pass
 
 bp_list = uniq_sorted(pool3, COL_BP)
 sel_bp = st.sidebar.selectbox("BP명", ["전체"] + bp_list, index=0, key="f_bp")
@@ -551,7 +596,7 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation (⑤ SKU별 조회 추가)
+# Navigation (⑤ SKU별 조회)
 # =========================
 nav = st.radio(
     "메뉴",
@@ -661,8 +706,8 @@ elif nav == "② 월 Top10":
         st.info("월 목록이 없습니다. RAW의 '년', '월1' 컬럼을 확인해 주세요.")
         st.stop()
 
-    sel_month_label = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
-    mdf = d[d["_month_label"].astype(str) == str(sel_month_label)].copy()
+    sel_month_label2 = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
+    mdf = d[d["_month_label"].astype(str) == str(sel_month_label2)].copy()
 
     top10 = (
         mdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
@@ -701,7 +746,7 @@ elif nav == "② 월 Top10":
     st.divider()
 
     st.subheader("전월 대비 급증 SKU 리포트 (+30% 이상 증가)")
-    cur_idx = month_list.index(sel_month_label) if sel_month_label in month_list else None
+    cur_idx = month_list.index(sel_month_label2) if sel_month_label2 in month_list else None
     if cur_idx is None or cur_idx == 0:
         st.info("전월 비교를 위해서는 선택 월 이전의 월 데이터가 필요합니다.")
     else:
@@ -711,7 +756,7 @@ elif nav == "② 월 Top10":
         spike_df = build_spike_report_only(mdf, prev_mdf)
 
         st.caption(
-            f"※ 비교 기준: 선택 월({sel_month_label}) vs 전월({prev_month_label}) | "
+            f"※ 비교 기준: 선택 월({sel_month_label2}) vs 전월({prev_month_label}) | "
             f"급증 정의: 현재 요청수량 ≥ 전월 요청수량 × {SPIKE_FACTOR} (전월 대비 +30% 이상 증가)"
         )
 
@@ -813,7 +858,7 @@ elif nav == "④ BP명별 조회":
     )
 
 # =========================
-# ⑤ SKU별 조회 (✅ 품목코드 입력 검색)
+# ⑤ SKU별 조회
 # =========================
 elif nav == "⑤ SKU별 조회":
     st.subheader("SKU별 조회")
@@ -821,12 +866,18 @@ elif nav == "⑤ SKU별 조회":
     if not need_cols(df_view, [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY, COL_SHIP, COL_BP], "SKU별 조회"):
         st.stop()
 
+    show_all_history = st.checkbox("전체 히스토리 보기", value=True, key="sku_show_all_history")
+
     base = df_view.copy()
     base[COL_ITEM_CODE] = base[COL_ITEM_CODE].astype(str).str.strip()
     base[COL_ITEM_NAME] = base[COL_ITEM_NAME].astype(str).str.strip()
 
-    # 검색 입력
-    q = st.text_input("품목코드 검색 (예: B5SN005A1)", value="", placeholder="품목코드를 입력하세요")
+    q = st.text_input(
+        "품목코드 검색 (부분검색 가능)",
+        value="",
+        placeholder="예: B5SN005A1",
+        key="sku_query"
+    )
 
     if not q.strip():
         st.info("상단에 품목코드를 입력하면, 해당 SKU의 출고일자/BP명/요청수량이 표시됩니다.")
@@ -834,7 +885,6 @@ elif nav == "⑤ SKU별 조회":
 
     q_norm = q.strip().upper()
 
-    # 부분검색 후보
     candidates = (
         base[base[COL_ITEM_CODE].str.upper().str.contains(re.escape(q_norm), na=False)][[COL_ITEM_CODE, COL_ITEM_NAME]]
         .dropna(subset=[COL_ITEM_CODE])
@@ -847,21 +897,19 @@ elif nav == "⑤ SKU별 조회":
         st.warning("해당 품목코드가 현재 필터 범위에서 조회되지 않습니다.")
         st.stop()
 
-    # 후보가 여러 개면 선택
     if len(candidates) > 1:
         cand_map = dict(zip(candidates[COL_ITEM_CODE], candidates[COL_ITEM_NAME]))
         sel_code = st.selectbox(
             "검색 결과에서 선택",
             candidates[COL_ITEM_CODE].tolist(),
+            key="sku_candidate_pick",
             format_func=lambda x: f"{x} / {cand_map.get(x, '')}".strip()
         )
     else:
         sel_code = candidates.iloc[0][COL_ITEM_CODE]
 
-    # 선택 SKU 데이터
     d = base[base[COL_ITEM_CODE] == sel_code].copy()
 
-    # 대표 품목명(첫 값)
     item_name = "-"
     nn = d[COL_ITEM_NAME].dropna()
     if not nn.empty:
@@ -870,8 +918,12 @@ elif nav == "⑤ SKU별 조회":
     st.markdown(f"- **품목코드:** {html.escape(sel_code)}")
     st.markdown(f"- **품목명:** {html.escape(item_name)}")
 
-    # 출고일자 공백 -> 미정 (datetime NaT 포함)
     d[COL_SHIP] = d[COL_SHIP].replace("", pd.NA)
+
+    if not show_all_history:
+        today_ts = pd.Timestamp(date.today())
+        ship_dt = pd.to_datetime(d[COL_SHIP], errors="coerce")
+        d = d[(ship_dt.isna()) | (ship_dt >= today_ts)].copy()
 
     def ship_to_label(x):
         if pd.isna(x):
@@ -880,7 +932,6 @@ elif nav == "⑤ SKU별 조회":
 
     d["출고예정일"] = d[COL_SHIP].apply(ship_to_label)
 
-    # ✅ 원하는 결과: 출고일자 / BP명 / 요청수량 (BP 여러개면 행 분리 + 합)
     out = (
         d.groupby(["출고예정일", COL_BP], dropna=False)[COL_QTY]
         .sum(min_count=1)
@@ -889,7 +940,6 @@ elif nav == "⑤ SKU별 조회":
     )
     out["요청수량"] = out["요청수량"].fillna(0).round(0).astype(int)
 
-    # 정렬: 미정은 아래로 보내고, 날짜는 오름차순 / 요청수량은 내림차순
     out["_sort_date"] = pd.to_datetime(out["출고예정일"], errors="coerce")
     out = out.sort_values(
         by=["_sort_date", "출고예정일", "요청수량"],
@@ -901,7 +951,7 @@ elif nav == "⑤ SKU별 조회":
         out[["출고예정일", "BP명", "요청수량"]],
         height=520,
         wrap_cols=["BP명"],
-        col_width_px={"출고예정일": 140, "BP명": 360, "요청수량": 120},
+        col_width_px={"출고예정일": 140, "BP명": 420, "요청수량": 120},
         number_cols=["요청수량"],
     )
 
