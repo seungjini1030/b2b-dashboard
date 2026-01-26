@@ -13,10 +13,14 @@
 #    ※ "전주 0 → 이번 주 발생(신규)" 섹션은 제거
 # - ✅ UI 튜닝: 표 가독성(헤더 고정/줄바꿈/컬럼폭/지브라/폰트) + KPI 카드 개선
 # - ✅ 메뉴 순서 변경:
-#   ① 주차 Top10  ② 월 Top10  ③ 국가별 조회(국가 KPI)  ④ BP명별 조회(BP KPI)
+#   ① 주차 Top10  ② 월 Top10  ③ 국가별 조회(국가 KPI)  ④ BP명별 조회(BP KPI)  ⑤ SKU별 조회
 # - ✅ 주차 산정 방식 변경:
 #   - SAP RAW에 '주차' 컬럼이 있으면, 그 값을 기반으로 _week_label 생성(=RAW 기반)
 #   - '주차' 컬럼이 없을 때만 출고일자 기반으로 생성
+# - ✅ 추가3: SKU별 조회
+#   - 드롭다운에서 "품목코드 / 품목명" 함께 표시
+#   - 품목코드/품목명/출고예정일(=출고일자, 공백이면 미정)/BP명/요청수량
+#   - BP명이 여러개면 BP명별로 행 분리(요청수량 합계)
 # ==========================================
 
 import re
@@ -61,8 +65,6 @@ st.set_page_config(page_title="B2B 출고 대시보드 (Google Sheet 기반)", l
 
 # -------------------------
 # UI Style (✅ 헤더 sticky 안정화 버전)
-# - 핵심: table 자체에 overflow:hidden / border-radius 주지 않기
-# - wrapper(frame)에 border-radius + overflow:hidden 부여
 # -------------------------
 BASE_CSS = """
 <style>
@@ -227,7 +229,6 @@ def render_pretty_table(
         tbody_rows.append("<tr>" + "".join(tds) + "</tr>")
     tbody = "<tbody>" + "".join(tbody_rows) + "</tbody>"
 
-    # ✅ 핵심: frame(라운드/clip) → scroll(overflow) → table(sticky)
     st.markdown(
         f"""
         <div class="pretty-table-wrap">
@@ -594,11 +595,11 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation (순서/명칭 변경)
+# Navigation (순서/명칭 변경 + ⑤ SKU별 조회 추가)
 # =========================
 nav = st.radio(
     "메뉴",
-    ["① 주차 Top10", "② 월 Top10", "③ 국가별 조회", "④ BP명별 조회"],
+    ["① 주차 Top10", "② 월 Top10", "③ 국가별 조회", "④ BP명별 조회", "⑤ SKU별 조회"],
     horizontal=True,
     key="nav_menu"
 )
@@ -856,8 +857,67 @@ elif nav == "④ BP명별 조회":
     )
 
 # =========================
-# Footer
+# ⑤ SKU별 조회
 # =========================
-st.caption(
-    "※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터(거래처구분1/2/월/BP) 범위 내에서 계산됩니다."
-)
+elif nav == "⑤ SKU별 조회":
+    st.subheader("SKU별 조회")
+
+    if not need_cols(df_view, [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY, COL_SHIP, COL_BP], "SKU별 조회"):
+        st.stop()
+
+    base = df_view.copy()
+
+    # ✅ 품목코드별 대표 품목명 매핑(중복이면 첫 값)
+    sku_master = base[[COL_ITEM_CODE, COL_ITEM_NAME]].dropna(subset=[COL_ITEM_CODE]).copy()
+    sku_master[COL_ITEM_CODE] = sku_master[COL_ITEM_CODE].astype(str).str.strip()
+    sku_master[COL_ITEM_NAME] = sku_master[COL_ITEM_NAME].astype(str).str.strip()
+
+    code_to_name = (
+        sku_master.drop_duplicates(subset=[COL_ITEM_CODE])
+        .set_index(COL_ITEM_CODE)[COL_ITEM_NAME]
+        .to_dict()
+    )
+
+    sku_codes = sorted(code_to_name.keys())
+    if not sku_codes:
+        st.info("현재 필터 조건에서 조회 가능한 품목코드가 없습니다.")
+        st.stop()
+
+    # ✅ 드롭다운에 '품목코드 / 품목명' 같이 표시
+    selected_code = st.selectbox(
+        "품목코드 선택",
+        sku_codes,
+        index=0,
+        format_func=lambda x: f"{x} / {code_to_name.get(x, '')}".strip()
+    )
+
+    # 선택 SKU 데이터
+    d = base[base[COL_ITEM_CODE].astype(str).str.strip() == str(selected_code).strip()].copy()
+
+    # 출고예정일(=출고일자) 공백이면 '미정'
+    d[COL_SHIP] = d[COL_SHIP].replace("", pd.NA)
+    d["출고예정일"] = d[COL_SHIP].apply(lambda x: "미정" if pd.isna(x) else fmt_date(x))
+
+    # BP명별 요청수량 합계로 행 분리
+    out = (
+        d.groupby([COL_ITEM_CODE, COL_ITEM_NAME, "출고예정일", COL_BP], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(columns={
+            COL_ITEM_CODE: "품목코드",
+            COL_ITEM_NAME: "품목명",
+            COL_BP: "출고업체(BP명)",
+            COL_QTY: "요청수량"
+        })
+    )
+
+    out["요청수량"] = out["요청수량"].fillna(0).round(0).astype(int)
+    out = out.sort_values(["출고예정일", "요청수량"], ascending=[True, False], na_position="last")
+
+    # 상단 요약
+    st.markdown(
+        f"- **품목코드:** {html.escape(str(selected_code))}\n"
+        f"- **품목명:** {html.escape(code_to_name.get(str(selected_code), ''))}"
+    )
+
+    render
