@@ -432,7 +432,7 @@ def load_raw_from_gsheet() -> pd.DataFrame:
             return f"{y}년 {m}월 {wk}주차"
         df["_week_label"] = df[COL_SHIP].apply(make_week_label_from_shipdate) if COL_SHIP in df.columns else None
 
-    # ✅ year+month 라벨 생성: 2025년 11월 / 2026년 1월
+    # ✅ year+month 라벨 생성
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce")
@@ -454,7 +454,6 @@ st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래�
 # ✅ 새로고침: 캐시 + 메뉴/화면 상태 리셋
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
-
     reset_keys = [
         "nav_menu", "wk_sel_week", "m_sel_month",
         "sku_query", "sku_candidate_pick", "sku_show_all_history",
@@ -463,7 +462,6 @@ if st.button("🔄 데이터 새로고침"):
     for k in reset_keys:
         if k in st.session_state:
             del st.session_state[k]
-
     st.session_state["nav_menu"] = "① 주차 Top10"
     st.rerun()
 
@@ -500,7 +498,7 @@ pool2 = pool1.copy()
 if sel_cust2 != "전체" and COL_CUST2 in pool2.columns:
     pool2 = pool2[pool2[COL_CUST2].astype(str).str.strip() == sel_cust2]
 
-# ✅ 월 필터: "년+월"로 표시 (2025년 11월 / 2026년 1월)
+# ✅ 월 필터: "년+월"
 month_labels = []
 if "_month_label" in pool2.columns:
     month_labels = [x for x in pool2["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
@@ -513,13 +511,6 @@ pool3 = pool2.copy()
 if sel_month_label != "전체":
     if "_month_label" in pool3.columns:
         pool3 = pool3[pool3["_month_label"].astype(str) == str(sel_month_label)]
-    else:
-        # fallback(거의 안 탐): _month_label 없으면 기존 월1 숫자 방식
-        try:
-            m_int = int(str(sel_month_label).replace("월", "").strip())
-            pool3 = pool3[pd.to_numeric(pool3[COL_MONTH], errors="coerce") == m_int]
-        except Exception:
-            pass
 
 bp_list = uniq_sorted(pool3, COL_BP)
 sel_bp = st.sidebar.selectbox("BP명", ["전체"] + bp_list, index=0, key="f_bp")
@@ -596,7 +587,7 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation (⑤ SKU별 조회)
+# Navigation
 # =========================
 nav = st.radio(
     "메뉴",
@@ -918,9 +909,15 @@ elif nav == "⑤ SKU별 조회":
     st.markdown(f"- **품목코드:** {html.escape(sel_code)}")
     st.markdown(f"- **품목명:** {html.escape(item_name)}")
 
+    # 공백/NaT 통일
     d[COL_SHIP] = d[COL_SHIP].replace("", pd.NA)
 
-    if not show_all_history:
+    # ✅ 핵심 수정:
+    # - '전체 히스토리 보기' OFF 조건은 "왼쪽 월 필터가 전체일 때만" 적용
+    # - 월을 특정(예: 2026년 1월)하면 OFF여도 월 필터 결과는 그대로 보여줌
+    month_filter_is_all = (sel_month_label == "전체")
+
+    if (not show_all_history) and month_filter_is_all:
         today_ts = pd.Timestamp(date.today())
         ship_dt = pd.to_datetime(d[COL_SHIP], errors="coerce")
         d = d[(ship_dt.isna()) | (ship_dt >= today_ts)].copy()
@@ -952,7 +949,7 @@ elif nav == "⑤ SKU별 조회":
         height=520,
         wrap_cols=["BP명"],
         col_width_px={"출고예정일": 140, "BP명": 420, "요청수량": 120},
-        number_cols=["요청수량"],
+        number_cols=["요청수량"],   # ✅ 콤마 표시
     )
 
 # =========================
