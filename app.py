@@ -67,6 +67,20 @@ h1, h2, h3 {letter-spacing: -0.2px;}
 .kpi-big {font-size:1.55rem; font-weight:800; color:#111827; line-height:1.15;}
 .kpi-muted {color:#6b7280; font-size:0.85rem; margin-top:0.15rem; white-space:normal; word-break:break-word;}
 
+/* ✅ SKU 화면용 미니 KPI (회색 박스) */
+.mini-kpi-wrap{display:flex; gap:0.6rem; flex-wrap:wrap; margin:0.55rem 0 0.25rem 0;}
+.mini-kpi{
+  background:#f9fafb;
+  border:1px solid #e5e7eb;
+  border-radius:12px;
+  padding:0.55rem 0.7rem;
+  display:flex;
+  align-items:baseline;
+  gap:0.55rem;
+}
+.mini-kpi .t{color:#6b7280; font-size:0.9rem;}
+.mini-kpi .v{color:#111827; font-size:1.05rem; font-weight:800; font-variant-numeric: tabular-nums;}
+
 .pretty-table-wrap {margin-top: 0.25rem;}
 .table-frame{
   border: 1px solid #e5e7eb;
@@ -229,6 +243,19 @@ def render_pretty_table(
                 {tbody}
               </table>
             </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def render_mini_kpi(label: str, value: str):
+    st.markdown(
+        f"""
+        <div class="mini-kpi-wrap">
+          <div class="mini-kpi">
+            <div class="t">{html.escape(label)}</div>
+            <div class="v">{html.escape(value)}</div>
           </div>
         </div>
         """,
@@ -432,7 +459,6 @@ def load_raw_from_gsheet() -> pd.DataFrame:
             return f"{y}년 {m}월 {wk}주차"
         df["_week_label"] = df[COL_SHIP].apply(make_week_label_from_shipdate) if COL_SHIP in df.columns else None
 
-    # ✅ year+month 라벨 생성
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce")
@@ -909,14 +935,10 @@ elif nav == "⑤ SKU별 조회":
     st.markdown(f"- **품목코드:** {html.escape(sel_code)}")
     st.markdown(f"- **품목명:** {html.escape(item_name)}")
 
-    # 공백/NaT 통일
     d[COL_SHIP] = d[COL_SHIP].replace("", pd.NA)
 
-    # ✅ 핵심 수정:
-    # - '전체 히스토리 보기' OFF 조건은 "왼쪽 월 필터가 전체일 때만" 적용
-    # - 월을 특정(예: 2026년 1월)하면 OFF여도 월 필터 결과는 그대로 보여줌
+    # ✅ OFF 로직은 "왼쪽 월 필터가 전체일 때만" 적용
     month_filter_is_all = (sel_month_label == "전체")
-
     if (not show_all_history) and month_filter_is_all:
         today_ts = pd.Timestamp(date.today())
         ship_dt = pd.to_datetime(d[COL_SHIP], errors="coerce")
@@ -936,6 +958,10 @@ elif nav == "⑤ SKU별 조회":
         .rename(columns={COL_BP: "BP명", COL_QTY: "요청수량"})
     )
     out["요청수량"] = out["요청수량"].fillna(0).round(0).astype(int)
+
+    # ✅ 요청수량 합산(현재 화면에 표시되는 결과 기준)
+    total_sku_qty = int(out["요청수량"].fillna(0).sum()) if not out.empty else 0
+    render_mini_kpi("요청수량 합산", f"{total_sku_qty:,}")
 
     out["_sort_date"] = pd.to_datetime(out["출고예정일"], errors="coerce")
     out = out.sort_values(
