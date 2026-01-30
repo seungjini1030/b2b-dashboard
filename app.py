@@ -1,5 +1,12 @@
 # ==========================================
 # B2B 출고 대시보드 (Google Sheet 기반)
+# - ✅ ⑤ SKU별 조회 확장:
+#   1) (왼쪽 필터 범위 기준) SKU Top10 (요청수량 기준) + BP명(요청수량)
+#      - 월=전체 : 누적 Top10
+#      - 월=특정 : 해당 월 Top10
+#   2) SKU 단건 조회(검색) + 전체 히스토리 보기 토글 + 요청수량 합산(미니 KPI)
+# - ✅ 요청수량/집계값 천단위 콤마 표시
+# - ✅ 새로고침 시 메인(①)로 리셋
 # ==========================================
 
 import re
@@ -329,6 +336,7 @@ def parse_month_label_key(label: str) -> tuple[int, int]:
 # BP list helpers
 # -------------------------
 def build_bp_list_map(df_period: pd.DataFrame) -> pd.DataFrame:
+    """(품목코드,품목명)별로 BP명(요청수량) 문자열 생성"""
     if df_period.empty:
         return pd.DataFrame(columns=[COL_ITEM_CODE, COL_ITEM_NAME, "BP명(요청수량)"])
 
@@ -376,6 +384,28 @@ def build_item_top5_with_bp(df_period: pd.DataFrame) -> pd.DataFrame:
     top5["요청수량_합"] = top5["요청수량_합"].fillna(0).round(0).astype(int)
     top5["BP명(요청수량)"] = top5["BP명(요청수량)"].fillna("")
     return top5[["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"]]
+
+def build_item_top10_with_bp(df_period: pd.DataFrame) -> pd.DataFrame:
+    """✅ SKU Top10(요청수량 기준) + BP명(요청수량)"""
+    if df_period.empty:
+        return pd.DataFrame(columns=["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"])
+
+    top10 = (
+        df_period.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(columns={COL_QTY: "요청수량_합"})
+        .sort_values("요청수량_합", ascending=False, na_position="last")
+        .head(10)
+        .copy()
+    )
+
+    bp_map = build_bp_list_map(df_period)
+    top10 = top10.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
+    top10.insert(0, "순위", range(1, len(top10) + 1))
+    top10["요청수량_합"] = top10["요청수량_합"].fillna(0).round(0).astype(int)
+    top10["BP명(요청수량)"] = top10["BP명(요청수량)"].fillna("")
+    return top10[["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"]]
 
 def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
     cols = [COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량", "현재_요청수량", "증가배수", "BP명(요청수량)"]
@@ -883,6 +913,29 @@ elif nav == "⑤ SKU별 조회":
     if not need_cols(df_view, [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY, COL_SHIP, COL_BP], "SKU별 조회"):
         st.stop()
 
+    # -------------------------------------------------
+    # ✅ (왼쪽 필터 범위 기준) SKU Top10 + BP Breakdown
+    #   - 월=전체: 누적 Top10
+    #   - 월=특정: 해당 월 Top10 (df_view가 이미 월로 필터됨)
+    # -------------------------------------------------
+    period_title = "누적 SKU Top10 (요청수량 기준)" if sel_month_label == "전체" else f"{sel_month_label} SKU Top10 (요청수량 기준)"
+    st.subheader(period_title)
+
+    top10_sku = build_item_top10_with_bp(df_view.copy())
+    render_pretty_table(
+        top10_sku,
+        height=420,
+        wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+        col_width_px={"순위": 60, COL_ITEM_CODE: 130, COL_ITEM_NAME: 360, "요청수량_합": 120, "BP명(요청수량)": 520},
+        number_cols=["요청수량_합"],
+    )
+    st.caption("※ BP명(요청수량)은 해당 SKU의 출고처별 수량 합계입니다. (왼쪽 필터 범위 기준)")
+
+    st.divider()
+
+    # -------------------------------------------------
+    # ✅ 단건 SKU 검색/조회
+    # -------------------------------------------------
     show_all_history = st.checkbox("전체 히스토리 보기", value=True, key="sku_show_all_history")
 
     base = df_view.copy()
