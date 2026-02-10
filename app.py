@@ -1,10 +1,9 @@
 # ==========================================
 # B2B 출고 대시보드 (Google Sheet 기반)
-# - ✅ ⑤ SKU별 조회 확장:
-#   1) (왼쪽 필터 범위 기준) SKU Top10 (요청수량 기준) + BP명(요청수량)
-#      - 월=전체 : 누적 Top10
-#      - 월=특정 : 해당 월 Top10
-#   2) SKU 단건 조회(검색) + 전체 히스토리 보기 토글 + 요청수량 합산(미니 KPI)
+# - ✅ 주차 Top10/월 Top10 메뉴명 변경: 주차요약/월간요약
+# - ✅ 주차요약/월간요약 자동 코멘트 추가 (룰 기반, 조건 충족 시만 노출)
+# - ✅ 리드타임 이상치: 사유 컬럼 없으므로 인보이스No(가능 시)/BP명 포함
+# - ✅ 출고건수: 주문번호 nunique 기준
 # - ✅ 요청수량/집계값 천단위 콤마 표시
 # - ✅ 새로고침 시 메인(①)로 리셋
 # ==========================================
@@ -14,6 +13,7 @@ import streamlit as st
 import pandas as pd
 import html
 from datetime import date
+import numpy as np
 
 # =========================
 # 컬럼명 표준화 (RAW 기준)
@@ -34,9 +34,20 @@ COL_ITEM_CODE = "품목코드"
 COL_ITEM_NAME = "품목명"
 COL_ORDER_DATE = "발주일자"
 
+# ✅ 출고건수(주문번호 nunique)
+COL_ORDERNO = "주문번호"
+
+# 인보이스 컬럼은 raw마다 이름이 달라서 "존재하는 것"을 자동 탐색
+INVOICE_CANDIDATES = [
+    "인보이스No.", "인보이스No", "인보이스번호", "Invoice No.", "InvoiceNo", "INVOICE NO", "INVOICE",
+    "송장번호", "문서번호"
+]
+
 KEEP_CLASSES = ["B0", "B1"]
 LT_ONLY_CUST1 = "해외B2B"
 SPIKE_FACTOR = 1.3  # 전주/전월 대비 +30%
+
+SPECIAL_BPS = {"박스미", "CGETC", "러메어홀딩스"}  # 집중도 예외 BP
 
 # =========================
 # Google Sheet 설정
@@ -231,7 +242,7 @@ def render_pretty_table(
                 cls.append("wrap")
             if c in number_cols:
                 cls.append("mono")
-                v_disp = _fmt_num_for_table(v)  # ✅ 콤마 포맷
+                v_disp = _fmt_num_for_table(v)
             else:
                 v_disp = "" if pd.isna(v) else str(v)
             class_attr = f' class="{" ".join(cls)}"' if cls else ""
@@ -268,6 +279,12 @@ def render_mini_kpi(label: str, value: str):
         """,
         unsafe_allow_html=True
     )
+
+def find_invoice_col(df: pd.DataFrame) -> str | None:
+    for c in INVOICE_CANDIDATES:
+        if c in df.columns:
+            return c
+    return None
 
 # -------------------------
 # Label helpers (RAW 기반)
@@ -444,6 +461,260 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
     return spike[cols]
 
+# =========================
+# 자동 코멘트 (주차/월 공용)
+# =========================
+def _fmt_int(x) -> str:
+    try:
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return "0"
+
+def _fmt_date_or_mijung(x) -> str:
+    if pd.isna(x) or x is None or str(x).strip() == "":
+        return "미정"
+    try:
+        return pd.to_datetime(x).strftime("%Y-%m-%d")
+    except Exception:
+        return str(x)
+
+def _top1_sku_code(df: pd.DataFrame) -> str | None:
+    if df.empty:
+        return None
+    g = df.groupby(COL_ITEM_CODE, dropna=False)[COL_QTY].sum().reset_index()
+    if g.empty:
+        return None
+    return str(g.sort_values(COL_QTY, ascending=False).iloc[0][COL_ITEM_CODE])
+
+def comment_growth_30_sku(df_cur: pd.DataFrame, df_prev: pd.DataFrame, top_n=5) -> list[str]:
+    if df_cur.empty or df_prev.empty:
+        return []
+    cur = df_cur.groupby([COL_ITEM_CODE], dropna=False)[COL_QTY].sum().reset_index(name="cur_qty")
+    prev = df_prev.groupby([COL_ITEM_CODE], dropna=False)[COL_QTY].sum().reset_index(name="prev_qty")
+    m = cur.merge(prev, on=COL_ITEM_CODE, how="left").fillna({"prev_qty": 0})
+    hit = m[(m["prev_qty"] > 0) & (m["cur_qty"] >= m["prev_qty"] * SPIKE_FACTOR)].copy()
+    if hit.empty:
+        return []
+    hit["growth_pct"] = (hit["cur_qty"] / hit["prev_qty"] - 1) * 100
+    hit = hit.sort_values("growth_pct", ascending=False).head(top_n)
+    lines = []
+    for _, r in hit.iterrows():
+        lines.append(
+            f"전기 대비 **+{r['growth_pct']:.0f}%** 증가 SKU: `{r[COL_ITEM_CODE]}` (전기 {_fmt_int(r['prev_qty'])} → 금기 {_fmt_int(r['cur_qty'])})"
+        )
+    return lines
+
+def comment_top_sku_changed(df_cur: pd.DataFrame, df_prev: pd.DataFrame) -> list[str]:
+    a = _top1_sku_code(df_prev)
+    b = _top1_sku_code(df_cur)
+    if (not a) or (not b) or (a == b):
+        return []
+    return [f"Top SKU 변경: 전기 `{a}` → 금기 `{b}`"]
+
+def comment_sku_concentration(df_cur: pd.DataFrame, conc_threshold=0.5, other_bp_min_share=0.15, top_n=5) -> list[str]:
+    """
+    - 기본: BP별로 Top SKU가 그 BP 물량의 50% 이상이면 코멘트
+    - 예외 BP(박스미/CGETC/러메어홀딩스):
+      Top SKU가 채널전용일 수 있어, 동일 SKU가 다른 BP에도 의미 있게(15% 이상) 있으면 같이 표기
+    """
+    if df_cur.empty:
+        return []
+
+    lines = []
+
+    # BP별 집중도 (BP 내 Top SKU 비중)
+    bp_tot = df_cur.groupby(COL_BP, dropna=False)[COL_QTY].sum()
+    bp_sku = df_cur.groupby([COL_BP, COL_ITEM_CODE], dropna=False)[COL_QTY].sum().reset_index()
+
+    for bp, tot in bp_tot.items():
+        if tot is None or tot == 0:
+            continue
+        sub = bp_sku[bp_sku[COL_BP] == bp].sort_values(COL_QTY, ascending=False)
+        if sub.empty:
+            continue
+        top_row = sub.iloc[0]
+        sku = str(top_row[COL_ITEM_CODE])
+        share_in_bp = float(top_row[COL_QTY]) / float(tot)
+
+        if share_in_bp < conc_threshold:
+            continue
+
+        if str(bp) in SPECIAL_BPS:
+            sku_by_bp = (
+                df_cur[df_cur[COL_ITEM_CODE] == sku]
+                .groupby(COL_BP, dropna=False)[COL_QTY].sum()
+                .sort_values(ascending=False)
+            )
+            sku_total = float(sku_by_bp.sum()) if not sku_by_bp.empty else 0.0
+            if sku_total <= 0:
+                lines.append(f"SKU 집중도(예외BP): **{bp}** 내 Top SKU `{sku}` 비중 **{share_in_bp*100:.0f}%**")
+                continue
+
+            top_bp = str(sku_by_bp.index[0])
+            top_bp_share = float(sku_by_bp.iloc[0]) / sku_total
+
+            others = sku_by_bp[sku_by_bp.index.astype(str) != top_bp]
+            meaningful = others[(others / sku_total) >= other_bp_min_share]
+
+            if meaningful.empty:
+                lines.append(f"SKU 집중도(예외BP): **{bp}** 내 Top SKU `{sku}` 비중 **{share_in_bp*100:.0f}%**")
+            else:
+                other_parts = ", ".join([f"{idx}({_fmt_int(val)})" for idx, val in meaningful.items()])
+                lines.append(
+                    f"SKU 집중도(예외BP): `{sku}`가 **{top_bp}** 중심(비중 {top_bp_share*100:.0f}%)이지만, 다른 BP도 후순위로 확인 → {other_parts}"
+                )
+        else:
+            lines.append(f"SKU 집중도: **{bp}** 내 Top SKU `{sku}` 비중 **{share_in_bp*100:.0f}%**")
+
+    return lines[:top_n]
+
+def comment_new_bp(df_cur: pd.DataFrame, df_prev: pd.DataFrame, top_n=5) -> list[str]:
+    if df_cur.empty:
+        return []
+    prev_bps = set(df_prev[COL_BP].dropna().astype(str).unique()) if not df_prev.empty else set()
+    cur_bps = set(df_cur[COL_BP].dropna().astype(str).unique())
+    new_bps = sorted(list(cur_bps - prev_bps))
+    if not new_bps:
+        return []
+
+    sub = df_cur[df_cur[COL_BP].astype(str).isin(new_bps)].copy()
+    g = sub.groupby(COL_BP, dropna=False).agg(
+        qty=(COL_QTY, "sum"),
+        first_ship=(COL_SHIP, "min"),
+    ).reset_index().sort_values("qty", ascending=False).head(top_n)
+
+    lines = []
+    for _, r in g.iterrows():
+        lines.append(
+            f"신규 BP 등장: **{r[COL_BP]}** / 요청수량 {_fmt_int(r['qty'])} / 출고일자 {_fmt_date_or_mijung(r['first_ship'])}"
+        )
+    return lines
+
+def comment_leadtime_outlier_with_invoice(df_cur: pd.DataFrame, invoice_col: str | None,
+                                          z=2.0, min_delta_if_no_std=2.0, top_n=5) -> list[str]:
+    """
+    거래처구분2 그룹별 평균 리드타임 대비 이상치:
+    - lt2 > mean + z*std (std=0이면 mean + 2일)
+    - 사유 컬럼 없으니, 인보이스No(가능 시) + BP명 같이 표시
+    """
+    if df_cur.empty or (COL_LT2 not in df_cur.columns) or (COL_CUST2 not in df_cur.columns):
+        return []
+
+    d = df_cur.dropna(subset=[COL_LT2]).copy()
+    if d.empty:
+        return []
+
+    stats = d.groupby(COL_CUST2, dropna=False)[COL_LT2].agg(["mean", "std", "count"]).reset_index()
+    d = d.merge(stats, on=COL_CUST2, how="left")
+
+    d["is_outlier"] = False
+    has_std = d["std"].fillna(0) > 0
+    d.loc[has_std, "is_outlier"] = d.loc[has_std, COL_LT2] > (d.loc[has_std, "mean"] + z * d.loc[has_std, "std"])
+    d.loc[~has_std, "is_outlier"] = d.loc[~has_std, COL_LT2] > (d.loc[~has_std, "mean"] + min_delta_if_no_std)
+
+    out = d[d["is_outlier"]].copy()
+    if out.empty:
+        return []
+
+    # 가장 큰 이상치부터
+    out["delta"] = out[COL_LT2] - out["mean"]
+    out = out.sort_values("delta", ascending=False).head(top_n)
+
+    lines = []
+    for _, r in out.iterrows():
+        inv = "-"
+        if invoice_col and invoice_col in out.columns:
+            inv_val = r.get(invoice_col, None)
+            inv = "-" if pd.isna(inv_val) else str(inv_val).strip()
+
+        bp = str(r.get(COL_BP, "-")).strip()
+        sku = str(r.get(COL_ITEM_CODE, "-")).strip()
+        grp = str(r.get(COL_CUST2, "-")).strip()
+
+        lines.append(
+            f"리드타임 이상치: [{grp}] 인보이스 `{inv}` / BP `{bp}` / SKU `{sku}` "
+            f"리드타임 {float(r[COL_LT2]):.1f} (그룹평균 {float(r['mean']):.1f}, +{float(r['delta']):.1f})"
+        )
+    return lines
+
+def comment_shipcount_spike_sku(df_cur: pd.DataFrame, df_prev: pd.DataFrame,
+                                spike_ratio=1.3, min_increase=3, top_n=5) -> list[str]:
+    if df_cur.empty or df_prev.empty:
+        return []
+    if COL_ORDERNO not in df_cur.columns or COL_ORDERNO not in df_prev.columns:
+        return []
+
+    cur = df_cur.groupby(COL_ITEM_CODE, dropna=False)[COL_ORDERNO].nunique().reset_index(name="cur_cnt")
+    prev = df_prev.groupby(COL_ITEM_CODE, dropna=False)[COL_ORDERNO].nunique().reset_index(name="prev_cnt")
+    m = cur.merge(prev, on=COL_ITEM_CODE, how="left").fillna({"prev_cnt": 0})
+    m["inc"] = m["cur_cnt"] - m["prev_cnt"]
+
+    hit = m[(m["prev_cnt"] > 0) & (m["cur_cnt"] >= m["prev_cnt"] * spike_ratio) & (m["inc"] >= min_increase)].copy()
+    if hit.empty:
+        return []
+    hit["growth_pct"] = (hit["cur_cnt"] / hit["prev_cnt"] - 1) * 100
+    hit = hit.sort_values("growth_pct", ascending=False).head(top_n)
+
+    lines = []
+    for _, r in hit.iterrows():
+        lines.append(
+            f"전주 대비 출고건수 급증 SKU: `{r[COL_ITEM_CODE]}` "
+            f"{int(r['prev_cnt'])}건 → {int(r['cur_cnt'])}건 (**+{r['growth_pct']:.0f}%**)"
+        )
+    return lines
+
+def comment_bp_qty_spike(df_cur: pd.DataFrame, df_prev: pd.DataFrame, spike_ratio=1.3, top_n=5) -> list[str]:
+    if df_cur.empty or df_prev.empty:
+        return []
+    cur = df_cur.groupby(COL_BP, dropna=False)[COL_QTY].sum().reset_index(name="cur_qty")
+    prev = df_prev.groupby(COL_BP, dropna=False)[COL_QTY].sum().reset_index(name="prev_qty")
+    m = cur.merge(prev, on=COL_BP, how="left").fillna({"prev_qty": 0})
+
+    hit = m[(m["prev_qty"] > 0) & (m["cur_qty"] >= m["prev_qty"] * spike_ratio)].copy()
+    if hit.empty:
+        return []
+    hit["growth_pct"] = (hit["cur_qty"] / hit["prev_qty"] - 1) * 100
+    hit = hit.sort_values("growth_pct", ascending=False).head(top_n)
+
+    lines = []
+    for _, r in hit.iterrows():
+        lines.append(
+            f"전월 대비 출고수량 급증 BP: **{r[COL_BP]}** "
+            f"{_fmt_int(r['prev_qty'])} → {_fmt_int(r['cur_qty'])} (**+{r['growth_pct']:.0f}%**)"
+        )
+    return lines
+
+def generate_summary_comments(df_cur: pd.DataFrame, df_prev: pd.DataFrame, mode: str, invoice_col: str | None) -> list[str]:
+    """
+    mode: "week" or "month"
+    """
+    comments: list[str] = []
+    # 1
+    comments += comment_growth_30_sku(df_cur, df_prev, top_n=5)
+    # 2
+    comments += comment_top_sku_changed(df_cur, df_prev)
+    # 3
+    comments += comment_sku_concentration(df_cur, top_n=5)
+    # 4
+    comments += comment_new_bp(df_cur, df_prev, top_n=5)
+    # 5
+    comments += comment_leadtime_outlier_with_invoice(df_cur, invoice_col=invoice_col, top_n=5)
+    # 6 (주차만)
+    if mode == "week":
+        comments += comment_shipcount_spike_sku(df_cur, df_prev, top_n=5)
+    # 7 (월만)
+    if mode == "month":
+        comments += comment_bp_qty_spike(df_cur, df_prev, top_n=5)
+
+    # 중복 제거
+    dedup = []
+    seen = set()
+    for c in comments:
+        if c not in seen:
+            dedup.append(c)
+            seen.add(c)
+    return dedup
+
 # -------------------------
 # Load RAW from Google Sheet (CSV export)
 # -------------------------
@@ -468,7 +739,7 @@ def load_raw_from_gsheet() -> pd.DataFrame:
 
     normalize_text_cols(
         df,
-        [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_WEEK_LABEL, COL_CLASS, COL_MAIN]
+        [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_WEEK_LABEL, COL_CLASS, COL_MAIN, COL_ORDERNO]
     )
 
     if COL_MAIN in df.columns:
@@ -518,7 +789,7 @@ if st.button("🔄 데이터 새로고침"):
     for k in reset_keys:
         if k in st.session_state:
             del st.session_state[k]
-    st.session_state["nav_menu"] = "① 주차 Top10"
+    st.session_state["nav_menu"] = "① 주차요약"
     st.rerun()
 
 try:
@@ -533,6 +804,8 @@ if COL_CLASS in raw.columns:
     raw = raw[raw[COL_CLASS].astype(str).str.strip().isin(KEEP_CLASSES)].copy()
 else:
     st.warning(f"'{COL_CLASS}' 컬럼이 없어 제품분류(B0/B1) 고정 필터를 적용할 수 없습니다.")
+
+invoice_col = find_invoice_col(raw)
 
 # =========================
 # Sidebar filters (cascading)
@@ -575,13 +848,20 @@ df_view = pool3.copy()
 if sel_bp != "전체" and COL_BP in df_view.columns:
     df_view = df_view[df_view[COL_BP].astype(str).str.strip() == sel_bp]
 
+# 대표행은 유지(기존 KPI용)
 df_rep = df_view[df_view["_is_rep"]].copy()
 
 # =========================
 # KPI cards
 # =========================
 total_qty = df_view[COL_QTY].fillna(0).sum() if COL_QTY in df_view.columns else None
-total_cnt = int(df_rep.shape[0])
+
+# ✅ 출고건수는 주문번호 nunique가 있으면 그걸 우선 사용 (없으면 대표행 rowcount fallback)
+if COL_ORDERNO in df_view.columns and not df_view.empty:
+    total_cnt = int(df_view[COL_ORDERNO].dropna().astype(str).nunique())
+else:
+    total_cnt = int(df_rep.shape[0])
+
 latest_done = df_view[COL_DONE].max() if COL_DONE in df_view.columns else None
 
 avg_lt2_overseas = None
@@ -600,8 +880,12 @@ if all(c in df_view.columns for c in [COL_BP, COL_QTY]) and not df_view.empty:
 
 top_bp_cnt_name = "-"
 top_bp_cnt_val = "-"
-if COL_BP in df_rep.columns and not df_rep.empty:
-    g2 = df_rep.groupby(COL_BP).size().sort_values(ascending=False)
+if COL_BP in df_view.columns and not df_view.empty:
+    if COL_ORDERNO in df_view.columns:
+        g2 = df_view.groupby(COL_BP, dropna=False)[COL_ORDERNO].nunique().sort_values(ascending=False)
+    else:
+        g2 = df_rep.groupby(COL_BP).size().sort_values(ascending=False)
+
     if not g2.empty:
         top_bp_cnt_name = str(g2.index[0])
         top_bp_cnt_val = f"{int(g2.iloc[0]):,}"
@@ -643,23 +927,23 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation
+# Navigation (✅ 메뉴명 변경)
 # =========================
 nav = st.radio(
     "메뉴",
-    ["① 주차 Top10", "② 월 Top10", "③ 국가별 조회", "④ BP명별 조회", "⑤ SKU별 조회"],
+    ["① 주차요약", "② 월간요약", "③ 국가별 조회", "④ BP명별 조회", "⑤ SKU별 조회"],
     horizontal=True,
     key="nav_menu"
 )
 
 # =========================
-# ① 주차 Top10
+# ① 주차요약
 # =========================
-if nav == "① 주차 Top10":
+if nav == "① 주차요약":
     st.subheader("주차 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
 
     d = df_view.copy()
-    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "주차 Top10"):
+    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "주차요약"):
         st.stop()
 
     week_list = [x for x in d["_week_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
@@ -671,6 +955,26 @@ if nav == "① 주차 Top10":
 
     sel_week = st.selectbox("주차 선택", week_list, index=len(week_list) - 1, key="wk_sel_week")
     wdf = d[d["_week_label"].astype(str) == str(sel_week)].copy()
+
+    # ✅ 전주 df 확보
+    cur_idx = week_list.index(sel_week) if sel_week in week_list else None
+    prev_week = None
+    prev_wdf = pd.DataFrame()
+    if cur_idx is not None and cur_idx > 0:
+        prev_week = week_list[cur_idx - 1]
+        prev_wdf = d[d["_week_label"].astype(str) == str(prev_week)].copy()
+
+    # ✅ 자동 코멘트
+    with st.expander("주차요약 자동 코멘트 (특이/이슈 포인트)", expanded=True):
+        if prev_week is None:
+            st.caption("전주 비교를 위해서는 선택 주차 이전의 주차 데이터가 필요합니다.")
+        else:
+            comments = generate_summary_comments(wdf, prev_wdf, mode="week", invoice_col=invoice_col)
+            if comments:
+                for c in comments:
+                    st.markdown(f"- {c}")
+            else:
+                st.caption("특이사항 없음")
 
     top10 = (
         wdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
@@ -709,20 +1013,14 @@ if nav == "① 주차 Top10":
     st.divider()
 
     st.subheader("전주 대비 급증 SKU 리포트 (+30% 이상 증가)")
-    cur_idx = week_list.index(sel_week) if sel_week in week_list else None
-    if cur_idx is None or cur_idx == 0:
+    if prev_week is None:
         st.info("전주 비교를 위해서는 선택 주차 이전의 주차 데이터가 필요합니다.")
     else:
-        prev_week = week_list[cur_idx - 1]
-        prev_wdf = d[d["_week_label"].astype(str) == str(prev_week)].copy()
-
         spike_df = build_spike_report_only(wdf, prev_wdf)
-
         st.caption(
             f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week}) | "
             f"급증 정의: 현재 요청수량 ≥ 전주 요청수량 × {SPIKE_FACTOR} (전주 대비 +30% 이상 증가)"
         )
-
         render_pretty_table(
             spike_df,
             height=520,
@@ -736,13 +1034,13 @@ if nav == "① 주차 Top10":
         )
 
 # =========================
-# ② 월 Top10
+# ② 월간요약
 # =========================
-elif nav == "② 월 Top10":
+elif nav == "② 월간요약":
     st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
 
     d = df_view.copy()
-    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "월 Top10"):
+    if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "월간요약"):
         st.stop()
 
     month_list = [x for x in d["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
@@ -755,6 +1053,26 @@ elif nav == "② 월 Top10":
 
     sel_month_label2 = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
     mdf = d[d["_month_label"].astype(str) == str(sel_month_label2)].copy()
+
+    # ✅ 전월 df 확보
+    cur_idx = month_list.index(sel_month_label2) if sel_month_label2 in month_list else None
+    prev_month_label = None
+    prev_mdf = pd.DataFrame()
+    if cur_idx is not None and cur_idx > 0:
+        prev_month_label = month_list[cur_idx - 1]
+        prev_mdf = d[d["_month_label"].astype(str) == str(prev_month_label)].copy()
+
+    # ✅ 자동 코멘트
+    with st.expander("월간요약 자동 코멘트 (특이/이슈 포인트)", expanded=True):
+        if prev_month_label is None:
+            st.caption("전월 비교를 위해서는 선택 월 이전의 월 데이터가 필요합니다.")
+        else:
+            comments = generate_summary_comments(mdf, prev_mdf, mode="month", invoice_col=invoice_col)
+            if comments:
+                for c in comments:
+                    st.markdown(f"- {c}")
+            else:
+                st.caption("특이사항 없음")
 
     top10 = (
         mdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
@@ -793,20 +1111,14 @@ elif nav == "② 월 Top10":
     st.divider()
 
     st.subheader("전월 대비 급증 SKU 리포트 (+30% 이상 증가)")
-    cur_idx = month_list.index(sel_month_label2) if sel_month_label2 in month_list else None
-    if cur_idx is None or cur_idx == 0:
+    if prev_month_label is None:
         st.info("전월 비교를 위해서는 선택 월 이전의 월 데이터가 필요합니다.")
     else:
-        prev_month_label = month_list[cur_idx - 1]
-        prev_mdf = d[d["_month_label"].astype(str) == str(prev_month_label)].copy()
-
         spike_df = build_spike_report_only(mdf, prev_mdf)
-
         st.caption(
             f"※ 비교 기준: 선택 월({sel_month_label2}) vs 전월({prev_month_label}) | "
             f"급증 정의: 현재 요청수량 ≥ 전월 요청수량 × {SPIKE_FACTOR} (전월 대비 +30% 이상 증가)"
         )
-
         render_pretty_table(
             spike_df,
             height=520,
@@ -840,7 +1152,11 @@ elif nav == "③ 국가별 조회":
 
     out = out.rename(columns={"p90_tmp": "리드타임 느린 상위10% 기준(P90)"})
 
-    rep_cnt = base[base["_is_rep"]].groupby(COL_CUST2).size()
+    # ✅ 출고건수 계산 우선순위: 주문번호 nunique > 대표행 카운트
+    if COL_ORDERNO in base.columns:
+        rep_cnt = base.groupby(COL_CUST2, dropna=False)[COL_ORDERNO].nunique()
+    else:
+        rep_cnt = base[base["_is_rep"]].groupby(COL_CUST2).size()
     out["출고건수"] = out[COL_CUST2].astype(str).map(rep_cnt).fillna(0).astype(int)
 
     out = out[
@@ -882,7 +1198,10 @@ elif nav == "④ BP명별 조회":
         집계행수_표본=(COL_BP, "size"),
     ).reset_index()
 
-    rep_cnt = base[base["_is_rep"]].groupby(COL_BP).size()
+    if COL_ORDERNO in base.columns:
+        rep_cnt = base.groupby(COL_BP, dropna=False)[COL_ORDERNO].nunique()
+    else:
+        rep_cnt = base[base["_is_rep"]].groupby(COL_BP).size()
     out["출고건수"] = out[COL_BP].astype(str).map(rep_cnt).fillna(0).astype(int)
 
     out["최근_출고일"] = out["최근_출고일"].apply(fmt_date)
@@ -1012,7 +1331,6 @@ elif nav == "⑤ SKU별 조회":
     )
     out["요청수량"] = out["요청수량"].fillna(0).round(0).astype(int)
 
-    # ✅ 요청수량 합산(현재 화면에 표시되는 결과 기준)
     total_sku_qty = int(out["요청수량"].fillna(0).sum()) if not out.empty else 0
     render_mini_kpi("요청수량 합산", f"{total_sku_qty:,}")
 
@@ -1028,7 +1346,7 @@ elif nav == "⑤ SKU별 조회":
         height=520,
         wrap_cols=["BP명"],
         col_width_px={"출고예정일": 140, "BP명": 420, "요청수량": 120},
-        number_cols=["요청수량"],   # ✅ 콤마 표시
+        number_cols=["요청수량"],
     )
 
 # =========================
