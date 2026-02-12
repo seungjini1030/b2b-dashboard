@@ -461,11 +461,15 @@ def sku_comment_bp_spike(df_sku: pd.DataFrame, spike_factor=1.5, top_n=3) -> lis
 def render_numbered_block(title: str, items: list[str]):
     if not items:
         return
+
     st.markdown(f"**{title}**\n\n")
+
     for i, line in enumerate(items, start=1):
-         st.markdown(
+        st.markdown(
             f"<div class='comment' style='margin-top:0.25rem;'>{i}) {line}</div>",
             unsafe_allow_html=True
+        )
+
 
 # -------------------------
 # Load RAW from Google Sheet (CSV export)
@@ -1009,3 +1013,4 @@ elif nav == "⑤ BP명별 조회":
 
 # Footer
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
+
