@@ -462,6 +462,7 @@ def render_numbered_block(title: str, items: list[str]):
     if not items:
         return
 
+    st.caption("DEBUG: render_numbered_block v2 적용됨")
     st.markdown(f"**{title}**\n\n")
 
     for i, line in enumerate(items, start=1):
@@ -1013,4 +1014,5 @@ elif nav == "⑤ BP명별 조회":
 
 # Footer
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
+
 
