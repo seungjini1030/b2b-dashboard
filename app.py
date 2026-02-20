@@ -6,9 +6,11 @@
 # - 코멘트 UI: 헤더-내용 간격 붙임 + 블록 간격 확보(가독성 개선)
 # - 주차 라벨: 출고일자 우선(없으면 작업완료일)로 산정하여 유령 주차 방지
 # - 전주/전월 +30% 급증 리포트: dtype(object) 에러 방지(증가배수 numeric 강제)
-# - ✅ 주차/월간 자동코멘트 추가:
+# - ✅ 주차/월간 자동코멘트:
 #    1) 신규 BP 출고(과거 전체기간에 없던 BP가 해당 주/월에 처음 등장)
-#    2) 전주/전월 대비: 발주건수(=주문번호 distinct) / 출고건수 / 출고수량 / 리드타임2 증감
+#    2) 전주/전월 대비 KPI 증감: 발주건수(=주문번호 distinct)/출고건수/출고수량/평균 리드타임2
+#    3) 카테고리 라인 TOP2(출고수량 기준)
+#    4) Top BP/Top SKU 집중도 + 출고일 미정 리스크(가능할 때만 표시)
 # ==========================================
 
 import re
@@ -38,6 +40,11 @@ COL_ORDER_DATE = "발주일자"
 
 # ✅ 발주건수 = 주문번호 distinct (중복 제거)
 COL_ORDER_NO = "주문번호"
+
+# ✅ 카테고리 라인(컬럼명이 확정이 아니라 후보를 둠)
+CATEGORY_COL_CANDIDATES = [
+    "카테고리 라인", "카테고리라인", "카테고리", "카테고리(Line)", "카테고리_LINE", "Category Line", "Category"
+]
 
 KEEP_CLASSES = ["B0", "B1"]
 LT_ONLY_CUST1 = "해외B2B"
@@ -140,10 +147,10 @@ hr {margin: 1.2rem 0;}
 .comment-title{
   font-weight: 900;
   font-size: 1.06rem;
-  margin: 0.2rem 0 0.25rem 0; /* 헤더-내용 간격 최소화 */
+  margin: 0.2rem 0 0.25rem 0;
 }
 .comment{
-  margin: 0.08rem 0 0 0;      /* 내용이 헤더에 붙게 */
+  margin: 0.08rem 0 0 0;
   line-height: 1.55;
 }
 </style>
@@ -324,7 +331,6 @@ def week_label_from_date(dt: pd.Timestamp) -> str | None:
     return f"{y}년 {m}월 {wk}주차"
 
 def build_week_label_from_row_safe(row: pd.Series) -> str | None:
-    # ✅ 출고일자 우선, 없으면 작업완료일 기준
     ship_dt = row.get(COL_SHIP, pd.NaT)
     done_dt = row.get(COL_DONE, pd.NaT)
     base_dt = ship_dt if pd.notna(ship_dt) else done_dt
@@ -350,7 +356,6 @@ def month_key_num_from_label(label: str) -> int | None:
 def render_numbered_block(title: str, items: list[str]):
     if not items:
         return
-
     st.markdown(
         f"""
         <div class="comment-block">
@@ -358,15 +363,8 @@ def render_numbered_block(title: str, items: list[str]):
         """,
         unsafe_allow_html=True
     )
-
     for i, line in enumerate(items, start=1):
-        st.markdown(
-            f"""
-            <div class="comment">{i}) {line}</div>
-            """,
-            unsafe_allow_html=True
-        )
-
+        st.markdown(f"""<div class="comment">{i}) {line}</div>""", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 # -------------------------
@@ -588,54 +586,68 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     spike["현재_요청수량"] = spike["현재_요청수량"].fillna(0).round(0).astype(int)
     spike["이전_요청수량"] = spike["이전_요청수량"].fillna(0).round(0).astype(int)
 
-    # ✅ object dtype 방지
     spike["증가배수"] = pd.to_numeric(spike["증가배수"], errors="coerce").round(2)
-
     spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
     return spike[cols]
 
 # -------------------------
 # ✅ 주차/월간 자동 코멘트 helpers
 # -------------------------
-def _arrow_delta(cur: float, prev: float, digits: int = 0, is_int: bool = True) -> str:
-    """+10 ▲ / -3 ▼ / 0 - 형태"""
+def _delta_text(diff: float, digits: int = 0) -> str:
+    """+6,638 / -4 등 숫자만 포맷"""
+    if pd.isna(diff):
+        return "-"
+    if digits == 0:
+        return f"{diff:+,.0f}"
+    return f"{diff:+,.{digits}f}"
+
+def _delta_arrow(diff: float) -> str:
+    """▲/▼/ -"""
+    if pd.isna(diff) or abs(diff) < 1e-12:
+        return "-"
+    return "▲" if diff > 0 else "▼"
+
+def _fmt_delta_with_arrow(cur: float, prev: float, digits: int = 0, force_int: bool = True) -> str:
+    """요청 포맷: -4 ▼ / +6,638 ▲ / 0 -"""
     if prev is None or pd.isna(prev):
         prev = 0
     if cur is None or pd.isna(cur):
         cur = 0
-
     diff = cur - prev
-    if abs(diff) < 1e-12:
-        return "0 -"
+    if force_int:
+        diff = float(int(round(diff)))
+    t = _delta_text(diff, digits=digits)
+    a = _delta_arrow(diff)
+    return f"{t} {a}"
 
-    arrow = "▲" if diff > 0 else "▼"
-    if is_int:
-        return f"{diff:+,.0f} {arrow}"
-    return f"{diff:+.{digits}f} {arrow}"
+def _clean_nunique(series: pd.Series) -> int:
+    if series is None:
+        return 0
+    s = series.astype(str).str.strip()
+    s = s.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return int(s.dropna().nunique())
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
     """
-    출고건수 정의:
-    - '주문번호' 컬럼이 있으면 nunique (문서/주문 기준)
-    - 없으면 대표행(True) count (기존 방식)
+    출고건수:
+    - 주문번호가 있으면 nunique (문서/주문 단위)
+    - 없으면 대표행(True) count
     """
     if df is None or df.empty:
         return 0
     if COL_ORDER_NO in df.columns:
-        return int(df[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA}).dropna().nunique())
+        return _clean_nunique(df[COL_ORDER_NO])
     if "_is_rep" in df.columns:
         return int(df["_is_rep"].sum())
     return int(df.shape[0])
 
 def _get_order_cnt(df: pd.DataFrame) -> int:
-    """
-    ✅ 발주건수 = 주문번호 distinct (중복 제거) 로 고정
-    """
+    """✅ 발주건수 = 주문번호 distinct (중복 제거) 고정"""
     if df is None or df.empty:
         return 0
     if COL_ORDER_NO not in df.columns:
         return 0
-    return int(df[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA}).dropna().nunique())
+    return _clean_nunique(df[COL_ORDER_NO])
 
 def _get_qty(df: pd.DataFrame) -> float:
     if df is None or df.empty or COL_QTY not in df.columns:
@@ -650,11 +662,13 @@ def _get_lt2_mean(df: pd.DataFrame) -> float:
         return float("nan")
     return float(s.mean())
 
+def _find_category_col(df: pd.DataFrame) -> str | None:
+    for c in CATEGORY_COL_CANDIDATES:
+        if c in df.columns:
+            return c
+    return None
+
 def new_bp_comment(all_df: pd.DataFrame, cur_df: pd.DataFrame, key_col_num: str, cur_key_num: int | None, top_n: int = 5) -> list[str]:
-    """
-    신규 BP 출고:
-    과거(현재 기간 이전) 전체에서 한 번도 안 나온 BP가 현재 기간에 등장하면 신규로 간주
-    """
     if cur_df is None or cur_df.empty or COL_BP not in cur_df.columns:
         return []
 
@@ -679,10 +693,86 @@ def new_bp_comment(all_df: pd.DataFrame, cur_df: pd.DataFrame, key_col_num: str,
 
     return [f"신규 출고 BP: {desc}"]
 
+def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
+    if cur_df is None or cur_df.empty:
+        return []
+    cat_col = _find_category_col(cur_df)
+    if not cat_col:
+        return []  # 컬럼 없으면 조용히 스킵
+
+    tmp = cur_df.copy()
+    tmp[cat_col] = tmp[cat_col].astype(str).str.strip()
+    if COL_QTY not in tmp.columns:
+        return []
+
+    g = (
+        tmp.groupby(cat_col, dropna=False)[COL_QTY]
+        .sum(min_count=1)
+        .sort_values(ascending=False)
+        .head(top_n)
+    )
+    if g.empty:
+        return []
+    desc = ", ".join([f"{idx}({_fmt_int(val)})" for idx, val in g.items()])
+    return [f"카테고리 TOP{top_n}: {desc}"]
+
+def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
+    """
+    추가 제안: 집중도(Top BP/Top SKU) -> 물량 편중 여부
+    """
+    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
+        return []
+
+    total = float(cur_df[COL_QTY].fillna(0).sum())
+    if total <= 0:
+        return []
+
+    out = []
+
+    if COL_BP in cur_df.columns:
+        g = cur_df.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False)
+        if len(g) >= 1:
+            top1 = float(g.iloc[0])
+            out.append(f"Top BP 집중도: 1위 {top1/total*100:.0f}%")
+        if len(g) >= 3:
+            top3 = float(g.iloc[:3].sum())
+            out.append(f"Top BP 집중도: 상위3개 {top3/total*100:.0f}%")
+
+    if all(c in cur_df.columns for c in [COL_ITEM_CODE, COL_ITEM_NAME]):
+        g2 = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY].sum().sort_values(ascending=False)
+        if len(g2) >= 1:
+            top_sku = float(g2.iloc[0])
+            out.append(f"Top SKU 집중도: 1위 {top_sku/total*100:.0f}%")
+
+    return out[:2]  # 너무 길어지지 않게 2줄만
+
+def undated_ship_risk_comment(cur_df: pd.DataFrame) -> list[str]:
+    """
+    추가 제안: 출고일 미정 리스크
+    - 출고일자 결측 라인의 수량/비중
+    """
+    if cur_df is None or cur_df.empty:
+        return []
+    if COL_SHIP not in cur_df.columns or COL_QTY not in cur_df.columns:
+        return []
+
+    total_qty = float(cur_df[COL_QTY].fillna(0).sum())
+    if total_qty <= 0:
+        return []
+
+    ship_dt = pd.to_datetime(cur_df[COL_SHIP], errors="coerce")
+    miss = cur_df[ship_dt.isna()].copy()
+    miss_qty = float(miss[COL_QTY].fillna(0).sum()) if not miss.empty else 0.0
+
+    if miss_qty <= 0:
+        return []
+    pct = miss_qty / total_qty * 100
+    return [f"출고일 미정 수량: {_fmt_int(miss_qty)} ({pct:.0f}%)"]
+
 def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> list[str]:
     """
-    전주/전월 대비:
-    발주건수(=주문번호 distinct) / 출고건수 / 출고수량 / 리드타임2(평균) 증감
+    요청 포맷으로 변경:
+    발주건수 -4 ▼ / 출고건수 -4 ▼ / 출고수량 +6,638 ▲ / 평균 리드타임2 -2 ▼
     """
     cur_order = _get_order_cnt(cur_df)
     prev_order = _get_order_cnt(prev_df)
@@ -696,15 +786,18 @@ def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> lis
     cur_lt = _get_lt2_mean(cur_df)
     prev_lt = _get_lt2_mean(prev_df)
 
-    lt_txt = "-"
-    if not pd.isna(cur_lt) and not pd.isna(prev_lt):
-        lt_txt = _arrow_delta(cur_lt, prev_lt, digits=1, is_int=False)
-    elif not pd.isna(cur_lt) and pd.isna(prev_lt):
-        lt_txt = f"{cur_lt:.1f} (직전기간 데이터 부족)"
+    order_txt = _fmt_delta_with_arrow(cur_order, prev_order, digits=0, force_int=True)
+    ship_txt = _fmt_delta_with_arrow(cur_ship, prev_ship, digits=0, force_int=True)
+    qty_txt = _fmt_delta_with_arrow(cur_qty, prev_qty, digits=0, force_int=True)
 
-    return [
-        f"직전기간 대비: 발주건수 {_arrow_delta(cur_order, prev_order)} · 출고건수 {_arrow_delta(cur_ship, prev_ship)} · 출고수량 {_arrow_delta(cur_qty, prev_qty)} · 평균 리드타임2 {lt_txt}"
-    ]
+    if (not pd.isna(cur_lt)) and (not pd.isna(prev_lt)):
+        lt_txt = _fmt_delta_with_arrow(cur_lt, prev_lt, digits=0, force_int=True)
+    elif (not pd.isna(cur_lt)) and pd.isna(prev_lt):
+        lt_txt = f"{_fmt_int(cur_lt)} (직전기간 데이터 부족)"
+    else:
+        lt_txt = "-"
+
+    return [f"직전기간 대비: 발주건수 {order_txt} / 출고건수 {ship_txt} / 출고수량 {qty_txt} / 평균 리드타임2 {lt_txt}"]
 
 # -------------------------
 # Load RAW
@@ -899,7 +992,7 @@ st.caption("※ 리드타임2 지표는 해외B2B(거래처구분1=해외B2B)만
 st.divider()
 
 # =========================
-# Navigation (요청 순서)
+# Navigation
 # =========================
 nav = st.radio(
     "메뉴",
@@ -909,7 +1002,7 @@ nav = st.radio(
 )
 
 # =========================
-# ① SKU별 조회 (검색 상단, Top10 하단 + 자동 코멘트)
+# ① SKU별 조회
 # =========================
 if nav == "① SKU별 조회":
     st.subheader("SKU별 조회")
@@ -920,7 +1013,6 @@ if nav == "① SKU별 조회":
     if not need_cols(sku_scope, [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY, COL_SHIP, COL_BP], "SKU별 조회"):
         st.stop()
 
-    # (A) 검색 상단
     st.markdown("### 품목코드 검색")
     show_all_history = st.checkbox("전체 히스토리 보기", value=True, key="sku_show_all_history")
 
@@ -984,7 +1076,6 @@ if nav == "① SKU별 조회":
 
             dsku["출고예정일"] = dsku[COL_SHIP].apply(ship_to_label)
 
-            # 자동 코멘트
             st.markdown("### 특이 / 이슈 포인트 (SKU 자동 코멘트)")
 
             sku_month = (
@@ -1042,7 +1133,6 @@ if nav == "① SKU별 조회":
 
     st.divider()
 
-    # (B) 누적 SKU Top10 하단 (왼쪽 필터 범위 기준)
     period_title = "누적 SKU Top10 (요청수량 기준)" if sel_month_label == "전체" else f"{sel_month_label} SKU Top10 (요청수량 기준)"
     st.markdown(f"### {period_title}")
 
@@ -1076,7 +1166,7 @@ elif nav == "② 주차요약":
     sel_week = st.selectbox("주차 선택", week_list, index=len(week_list) - 1, key="wk_sel_week")
     wdf = d[d["_week_label"].astype(str) == str(sel_week)].copy()
 
-    # ✅ 주간 자동 코멘트(신규 BP + 전주 대비 증감)
+    # ✅ 주간 자동 코멘트(신규 BP + 전주 대비 + 카테고리 TOP + 집중도/리스크)
     cur_key_num = week_key_num_from_label(sel_week)
     cur_idx = week_list.index(sel_week) if sel_week in week_list else None
 
@@ -1087,10 +1177,14 @@ elif nav == "② 주차요약":
         prev_week = week_list[cur_idx - 1]
         prev_wdf = d[d["_week_label"].astype(str) == str(prev_week)].copy()
 
-    c1 = new_bp_comment(all_df=d, cur_df=wdf, key_col_num="_week_key_num", cur_key_num=cur_key_num)
-    c2 = period_kpi_delta_comment(cur_df=wdf, prev_df=prev_wdf)
+    comment_items = []
+    comment_items += new_bp_comment(all_df=d, cur_df=wdf, key_col_num="_week_key_num", cur_key_num=cur_key_num)
+    comment_items += period_kpi_delta_comment(cur_df=wdf, prev_df=prev_wdf)
+    comment_items += category_top_comment(wdf, top_n=2)
+    comment_items += concentration_comment(wdf)
+    comment_items += undated_ship_risk_comment(wdf)
 
-    render_numbered_block("주간 특이사항 (자동 코멘트)", c1 + c2)
+    render_numbered_block("주간 특이사항 (자동 코멘트)", comment_items)
     if prev_week:
         st.caption(f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week})")
     st.divider()
@@ -1132,12 +1226,12 @@ elif nav == "② 주차요약":
     if cur_idx is None or cur_idx == 0:
         st.info("전주 비교를 위해서는 선택 주차 이전의 주차 데이터가 필요합니다.")
     else:
-        prev_week = week_list[cur_idx - 1]
-        prev_wdf2 = d[d["_week_label"].astype(str) == str(prev_week)].copy()
+        prev_week2 = week_list[cur_idx - 1]
+        prev_wdf2 = d[d["_week_label"].astype(str) == str(prev_week2)].copy()
         spike_df = build_spike_report_only(wdf, prev_wdf2)
 
         st.caption(
-            f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week}) | "
+            f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week2}) | "
             f"급증 정의: 현재 요청수량 ≥ 전주 요청수량 × {SPIKE_FACTOR} (전주 대비 +30% 이상 증가)"
         )
 
@@ -1174,7 +1268,7 @@ elif nav == "③ 월간요약":
     sel_month_label2 = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
     mdf = d[d["_month_label"].astype(str) == str(sel_month_label2)].copy()
 
-    # ✅ 월간 자동 코멘트(신규 BP + 전월 대비 증감)
+    # ✅ 월간 자동 코멘트(신규 BP + 전월 대비 + 카테고리 TOP + 집중도/리스크)
     cur_key_num = month_key_num_from_label(sel_month_label2)
     cur_idx = month_list.index(sel_month_label2) if sel_month_label2 in month_list else None
 
@@ -1185,10 +1279,14 @@ elif nav == "③ 월간요약":
         prev_month = month_list[cur_idx - 1]
         prev_mdf = d[d["_month_label"].astype(str) == str(prev_month)].copy()
 
-    c1 = new_bp_comment(all_df=d, cur_df=mdf, key_col_num="_month_key_num", cur_key_num=cur_key_num)
-    c2 = period_kpi_delta_comment(cur_df=mdf, prev_df=prev_mdf)
+    comment_items = []
+    comment_items += new_bp_comment(all_df=d, cur_df=mdf, key_col_num="_month_key_num", cur_key_num=cur_key_num)
+    comment_items += period_kpi_delta_comment(cur_df=mdf, prev_df=prev_mdf)
+    comment_items += category_top_comment(mdf, top_n=2)
+    comment_items += concentration_comment(mdf)
+    comment_items += undated_ship_risk_comment(mdf)
 
-    render_numbered_block("월간 특이사항 (자동 코멘트)", c1 + c2)
+    render_numbered_block("월간 특이사항 (자동 코멘트)", comment_items)
     if prev_month:
         st.caption(f"※ 비교 기준: 선택 월({sel_month_label2}) vs 전월({prev_month})")
     st.divider()
