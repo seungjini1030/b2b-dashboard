@@ -13,6 +13,11 @@
 #    4) Top BP 집중도: BP명(수량) + 점유율
 #    5) Top SKU 집중도: 품목코드/품목명(수량) + 점유율
 #    6) 출고일 미정 리스크(가능할 때만 표시)
+#
+# ✅ 이번 업데이트(요청 반영):
+# - "월간요약" 탭에만 적용되는 월별 보고용 리포트 생성 기능 추가
+# - 출력: “이번달 핵심 변화 5줄 + 리스크 3개 + 액션 3개”
+# - 방식: 기존 월간 자동 코멘트/지표를 기반으로 룰 기반 문장 생성(복붙용)
 # ==========================================
 
 import re
@@ -813,6 +818,236 @@ def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> lis
     return [f"직전기간 대비: {order_part} / {ship_part} / {qty_part} / {lt_part}"]
 
 # -------------------------
+# ✅ 월간 보고용 5/3/3 리포트(월간 탭에만 사용)
+# -------------------------
+def _pct(a: float, total: float) -> float:
+    if total <= 0:
+        return 0.0
+    return a / total * 100
+
+def _get_top_bp_stats(cur_df: pd.DataFrame) -> dict:
+    """
+    returns:
+      {"name": str, "qty": float, "share": float} or {"name": None...}
+    """
+    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns or COL_BP not in cur_df.columns:
+        return {"name": None, "qty": 0.0, "share": 0.0}
+    total = float(cur_df[COL_QTY].fillna(0).sum())
+    g = cur_df.groupby(COL_BP, dropna=False)[COL_QTY].sum().sort_values(ascending=False)
+    if g.empty or total <= 0:
+        return {"name": None, "qty": 0.0, "share": 0.0}
+    return {
+        "name": str(g.index[0]).strip(),
+        "qty": float(g.iloc[0]),
+        "share": _pct(float(g.iloc[0]), total)
+    }
+
+def _get_top_sku_stats(cur_df: pd.DataFrame) -> dict:
+    """
+    returns:
+      {"code": str, "name": str, "qty": float, "share": float} or empty
+    """
+    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
+        return {"code": None, "name": None, "qty": 0.0, "share": 0.0}
+    if (COL_ITEM_CODE not in cur_df.columns) or (COL_ITEM_NAME not in cur_df.columns):
+        return {"code": None, "name": None, "qty": 0.0, "share": 0.0}
+    total = float(cur_df[COL_QTY].fillna(0).sum())
+    g = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum().sort_values(ascending=False)
+    if g.empty or total <= 0:
+        return {"code": None, "name": None, "qty": 0.0, "share": 0.0}
+    (code, name) = g.index[0]
+    return {
+        "code": str(code).strip(),
+        "name": str(name).strip(),
+        "qty": float(g.iloc[0]),
+        "share": _pct(float(g.iloc[0]), total)
+    }
+
+def _get_spike_summary(spike_df: pd.DataFrame) -> str | None:
+    if spike_df is None or spike_df.empty:
+        return None
+    # "현재_요청수량" 기준 상위 1개
+    try:
+        tmp = spike_df.copy()
+        tmp["현재_요청수량"] = pd.to_numeric(tmp["현재_요청수량"], errors="coerce").fillna(0)
+        tmp = tmp.sort_values("현재_요청수량", ascending=False)
+        r = tmp.iloc[0]
+        code = str(r.get(COL_ITEM_CODE, "")).strip()
+        name = str(r.get(COL_ITEM_NAME, "")).strip()
+        prevq = int(r.get("이전_요청수량", 0))
+        curq = int(r.get("현재_요청수량", 0))
+        mult = r.get("증가배수", None)
+        mult_txt = f"{float(mult):.2f}x" if pd.notna(mult) else "-"
+        return f"급증 SKU: {code} / {name} ({prevq:,} → {curq:,}, {mult_txt})"
+    except Exception:
+        return "급증 SKU: 집계 가능(상세는 리포트 표 참고)"
+
+def build_monthly_report_533(
+    month_label: str,
+    prev_month_label: str | None,
+    cur_df: pd.DataFrame,
+    prev_df: pd.DataFrame,
+    all_df: pd.DataFrame,
+    spike_df: pd.DataFrame
+) -> dict:
+    """
+    returns: {"title": str, "key": list[str], "risk": list[str], "action": list[str], "paste": str}
+    """
+    # KPI
+    cur_order = _get_order_cnt(cur_df)
+    prev_order = _get_order_cnt(prev_df)
+    cur_ship = _get_ship_cnt(cur_df)
+    prev_ship = _get_ship_cnt(prev_df)
+    cur_qty = _get_qty(cur_df)
+    prev_qty = _get_qty(prev_df)
+    cur_lt = _get_lt_mean(cur_df)
+    prev_lt = _get_lt_mean(prev_df)
+
+    order_diff = cur_order - prev_order
+    ship_diff = cur_ship - prev_ship
+    qty_diff = cur_qty - prev_qty
+    lt_diff = (cur_lt - prev_lt) if (not pd.isna(cur_lt) and not pd.isna(prev_lt)) else float("nan")
+
+    # facts
+    new_bp = new_bp_comment(all_df=all_df, cur_df=cur_df, key_col_num="_month_key_num", cur_key_num=month_key_num_from_label(month_label))
+    cat = category_top_comment(cur_df, top_n=2)
+    conc = concentration_comment(cur_df)
+    undated = undated_ship_risk_comment(cur_df)
+    spike_summary = _get_spike_summary(spike_df)
+
+    top_bp = _get_top_bp_stats(cur_df)
+    top_sku = _get_top_sku_stats(cur_df)
+
+    # ---------- Key changes (5)
+    key = []
+    # 1) 신규 BP
+    if new_bp:
+        key.append(new_bp[0])
+
+    # 2) KPI 요약(한 줄)
+    if prev_month_label:
+        key.append(
+            f"{prev_month_label} 대비 KPI: "
+            f"발주 {cur_order}건({_fmt_delta(order_diff)}), "
+            f"출고 {cur_ship}건({_fmt_delta(ship_diff)}), "
+            f"수량 {cur_qty:,}개({_fmt_delta(qty_diff)})"
+            + (f", 리드타임 {cur_lt:.1f}일({_fmt_delta(lt_diff)})" if not pd.isna(cur_lt) and not pd.isna(prev_lt) else (f", 리드타임 {cur_lt:.1f}일" if not pd.isna(cur_lt) else ", 리드타임 -"))
+        )
+    else:
+        key.append(f"KPI: 발주 {cur_order}건 / 출고 {cur_ship}건 / 수량 {cur_qty:,}개" + (f" / 리드타임 {cur_lt:.1f}일" if not pd.isna(cur_lt) else ""))
+
+    # 3) 카테고리
+    if cat:
+        key.append(cat[0])
+
+    # 4) 집중도(Top BP/Top SKU)
+    if top_bp.get("name"):
+        key.append(f"Top BP: {top_bp['name']}({_fmt_int(top_bp['qty'])}) {top_bp['share']:.0f}%")
+    if top_sku.get("code"):
+        key.append(f"Top SKU: {top_sku['code']} / {top_sku['name']}({_fmt_int(top_sku['qty'])}) {top_sku['share']:.0f}%")
+
+    # 5) 급증 SKU
+    if spike_summary:
+        key.append(spike_summary)
+
+    # 혹시 5줄이 안 채워지면 기존 conc/undated에서 보강
+    for extra in (conc + undated):
+        if len(key) >= 5:
+            break
+        if extra and extra not in key:
+            key.append(extra)
+
+    key = key[:5]
+
+    # ---------- Risks (3)
+    risk = []
+
+    # 리드타임 악화
+    if not pd.isna(lt_diff) and lt_diff > 0:
+        risk.append(f"리드타임이 전월 대비 {lt_diff:.1f}일 증가(악화)했습니다. 병목 구간 점검 필요.")
+    elif not pd.isna(cur_lt) and pd.isna(prev_lt):
+        risk.append("리드타임은 산출되나 전월 비교 데이터가 부족합니다. 추세 판단을 위해 전월 데이터 점검 필요.")
+    elif not pd.isna(cur_lt):
+        risk.append("리드타임은 큰 악화 신호는 제한적이나, 상위 BP 중심으로 편차 모니터링 필요.")
+    else:
+        risk.append("리드타임 데이터가 부족하여 운영 리스크 판단이 제한됩니다. 리드타임 컬럼/결측 점검 필요.")
+
+    # 출고일 미정
+    if undated:
+        risk.append(undated[0])
+    else:
+        risk.append("출고일 미정 리스크: 확인된 미정 수량 없음(또는 데이터 부족).")
+
+    # 집중도/급증
+    if top_bp.get("share", 0) >= 50:
+        risk.append(f"Top BP 집중도가 {top_bp['share']:.0f}%로 높아 물량 편중 리스크가 있습니다.")
+    elif top_sku.get("share", 0) >= 40:
+        risk.append(f"Top SKU 집중도가 {top_sku['share']:.0f}%로 높아 SKU 의존 리스크가 있습니다.")
+    elif spike_df is not None and not spike_df.empty:
+        risk.append(f"+30% 급증 SKU가 {len(spike_df)}개 발생하여 월말 작업량 급증 가능성이 있습니다.")
+    else:
+        risk.append("특정 편중/급증 신호는 제한적이나, 월말 집중 출고 여부는 지속 모니터링 필요.")
+
+    risk = risk[:3]
+
+    # ---------- Actions (3)
+    action = []
+
+    # 액션1: 리드타임
+    if not pd.isna(lt_diff) and lt_diff > 0:
+        action.append("리드타임 악화 원인(포워더/통관/피킹/패킹)을 구간별로 확인하고 컷오프·출고 가이드를 업데이트합니다.")
+    else:
+        action.append("리드타임은 현 수준 유지. 상위 BP/국가 중심으로 SLA 준수 모니터링을 지속합니다.")
+
+    # 액션2: 출고일 미정
+    if undated:
+        action.append("출고일 미정 건은 우선순위로 일정 확정(내부/포워더 확인) 후, 월말 리스크 리스트로 별도 관리합니다.")
+    else:
+        action.append("출고일 정보는 현 수준 유지. 미정 발생 시 즉시 태깅하여 리스크로 자동 노출되도록 관리합니다.")
+
+    # 액션3: 집중/급증 대응
+    if spike_summary:
+        action.append("급증 SKU는 월초 선피킹/자재 사전 준비로 병목을 예방하고, 다음달 FCST 반영 여부를 확인합니다.")
+    elif top_bp.get("share", 0) >= 50 or top_sku.get("share", 0) >= 40:
+        action.append("물량 편중(Top BP/SKU)은 출고 캘린더 분산 및 작업량 사전 배치로 운영 리스크를 낮춥니다.")
+    else:
+        action.append("Top 품목/거래처 중심으로 다음달 예상 물량·프로모션 여부를 점검해 선제 대응합니다.")
+
+    action = action[:3]
+
+    title = f"📦 {month_label} 월간 리포트"
+
+    # 복붙 텍스트
+    lines = [title, ""]
+    lines.append("[핵심 변화]")
+    for i, s in enumerate(key, 1):
+        lines.append(f"{i}. {s}")
+    lines.append("")
+    lines.append("[리스크]")
+    for i, s in enumerate(risk, 1):
+        lines.append(f"{i}. {s}")
+    lines.append("")
+    lines.append("[액션]")
+    for i, s in enumerate(action, 1):
+        lines.append(f"{i}. {s}")
+
+    if prev_month_label:
+        lines.append("")
+        lines.append(f"(비교 기준: {month_label} vs {prev_month_label})")
+
+    return {
+        "title": title,
+        "key": key,
+        "risk": risk,
+        "action": action,
+        "paste": "\n".join(lines),
+    }
+
+def render_monthly_report_533(report: dict):
+    st.markdown("### 📌 월간 보고용 리포트 (복붙용)")
+    st.code(report["paste"], language=None)
+
+# -------------------------
 # Load RAW
 # -------------------------
 @st.cache_data(ttl=300)
@@ -1293,6 +1528,46 @@ elif nav == "③ 월간요약":
     render_numbered_block("월간 특이사항 (자동 코멘트)", comment_items)
     if prev_month:
         st.caption(f"※ 비교 기준: 선택 월({sel_month_label2}) vs 전월({prev_month})")
+    st.divider()
+
+    # ✅ 월간 보고용 리포트(5/3/3) — 월간에만 적용
+    st.markdown("## 🧾 월간 보고용 리포트 생성 (핵심 변화 5 / 리스크 3 / 액션 3)")
+    st.caption("버튼 클릭 시, 선택 월의 지표/코멘트를 기반으로 ‘복붙용 리포트’를 자동 생성합니다.")
+
+    # 전월 대비 급증 SKU 리포트 DataFrame을 리포트에도 재사용
+    if cur_idx is None or cur_idx == 0:
+        spike_df_for_report = pd.DataFrame()
+        prev_month_label_for_report = None
+    else:
+        prev_month_label_for_report = month_list[cur_idx - 1]
+        prev_mdf2_for_report = d[d["_month_label"].astype(str) == str(prev_month_label_for_report)].copy()
+        spike_df_for_report = build_spike_report_only(mdf, prev_mdf2_for_report)
+
+    if st.button("✅ 월간 리포트(복붙용) 생성", type="primary"):
+        report = build_monthly_report_533(
+            month_label=sel_month_label2,
+            prev_month_label=prev_month_label_for_report,
+            cur_df=mdf,
+            prev_df=prev_mdf,
+            all_df=d,
+            spike_df=spike_df_for_report,
+        )
+        render_monthly_report_533(report)
+
+        with st.expander("🔎 근거 데이터(요약) 보기", expanded=False):
+            st.write({
+                "선택월": sel_month_label2,
+                "전월": prev_month_label_for_report,
+                "발주건수(주문번호 distinct)": _get_order_cnt(mdf),
+                "출고건수(대표행 TRUE)": _get_ship_cnt(mdf),
+                "출고수량(합)": _get_qty(mdf),
+                "평균 리드타임": (round(_get_lt_mean(mdf), 2) if not pd.isna(_get_lt_mean(mdf)) else None),
+                "Top BP": _get_top_bp_stats(mdf),
+                "Top SKU": _get_top_sku_stats(mdf),
+                "+30% 급증 SKU 개수": int(len(spike_df_for_report)) if spike_df_for_report is not None else 0
+            })
+            st.caption("※ 급증 SKU 상세는 하단 ‘전월 대비 급증 SKU 리포트’ 표에서 확인 가능합니다.")
+
     st.divider()
 
     st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
