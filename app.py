@@ -2,8 +2,8 @@
 # B2B 출고 대시보드 (Google Sheet 기반)
 # - 메뉴 순서: ① SKU별 조회 -> ② 주차요약 -> ③ 월간요약 -> ④ 국가별 조회 -> ⑤ BP명별 조회
 # - SKU별 조회 UI: 품목코드 검색(상단) -> 누적 SKU Top10(하단)
-# - SKU 자동 코멘트(룰 기반): MoM(2개월), 추이(3개월), BP 급증 사례(월단위)
-# - 코멘트 UI: 헤더-내용 간격 붙임 + 블록 간격 확보(가독성 개선)
+# - SKU 자동 코멘트(룰 기반): MoM(2개월), 추이(3개월: 패턴 상세), BP 급증 사례(월단위)
+# - 코멘트 UI: 헤더-내용은 붙이고, 블록 간격만 확보(가독성 개선)
 # - 주차 라벨: 출고일자 우선(없으면 작업완료일)로 산정하여 유령 주차 방지
 # - 전주/전월 +30% 급증 리포트: dtype(object) 에러 방지(증가배수 numeric 강제)
 # - ✅ 주차/월간 자동코멘트:
@@ -11,6 +11,8 @@
 #    2) 전주/전월 대비 KPI 증감: 발주건수(=주문번호 distinct)/출고건수/출고수량/평균 리드타임2
 #    3) 카테고리 라인 TOP2(출고수량 기준)
 #    4) Top BP/Top SKU 집중도 + 출고일 미정 리스크(가능할 때만 표시)
+# - ✅ UI 수정:
+#    * 주차/월간 “Top10 제목”을 표 바로 위로 이동(스크롤/가독성 개선)
 # ==========================================
 
 import re
@@ -41,7 +43,7 @@ COL_ORDER_DATE = "발주일자"
 # ✅ 발주건수 = 주문번호 distinct (중복 제거)
 COL_ORDER_NO = "주문번호"
 
-# ✅ 카테고리 라인(컬럼명이 확정이 아니라 후보를 둠)
+# ✅ 카테고리 라인(컬럼명이 확정이 아니라 후보)
 CATEGORY_COL_CANDIDATES = [
     "카테고리 라인", "카테고리라인", "카테고리", "카테고리(Line)", "카테고리_LINE", "Category Line", "Category"
 ]
@@ -142,7 +144,7 @@ table.pretty-table{
 .mono {font-variant-numeric: tabular-nums;}
 hr {margin: 1.2rem 0;}
 
-/* ✅ 코멘트 UI (헤더-내용은 붙이고, 블록 간격은 확보) */
+/* ✅ 코멘트 UI */
 .comment-block { margin: 0.6rem 0 1.05rem 0; }
 .comment-title{
   font-weight: 900;
@@ -351,7 +353,7 @@ def month_key_num_from_label(label: str) -> int | None:
     return y * 100 + m
 
 # -------------------------
-# 코멘트 렌더(블록 단위)
+# 코멘트 렌더
 # -------------------------
 def render_numbered_block(title: str, items: list[str]):
     if not items:
@@ -368,7 +370,7 @@ def render_numbered_block(title: str, items: list[str]):
     st.markdown("</div>", unsafe_allow_html=True)
 
 # -------------------------
-# SKU 자동 코멘트(룰 기반)
+# SKU 자동 코멘트
 # -------------------------
 def _fmt_int(x) -> str:
     try:
@@ -401,20 +403,43 @@ def sku_comment_mom(sku_month: pd.DataFrame) -> list[str]:
     return [f"{prev['_month_label']} 대비 {cur['_month_label']} 출고량 **{direction} ({pct:+.0f}%)** · {_fmt_int(prev_q)} → {_fmt_int(cur_q)}"]
 
 def sku_comment_trend(sku_month: pd.DataFrame) -> list[str]:
+    """
+    ✅ 개선:
+    - 단순 '혼조/변동'이 아니라 최근 3개월 패턴을 구체적으로 설명
+    - (상승→하락/하락→상승/V자/역V자/중간월 피크/바닥 등)
+    """
     if sku_month is None or sku_month.empty:
         return []
     m = sku_month.sort_values("_month_key")
     if len(m) < 3:
         return []
-    last3 = m.iloc[-3:].copy()
-    q = last3["qty"].astype(float).tolist()
-    labels = last3["_month_label"].astype(str).tolist()
 
-    if q[0] < q[1] < q[2]:
-        return [f"최근 3개월({labels[0]} → {labels[2]}) 기준: 출고량 **지속 상승** 흐름 → **상승 예상(룰 기반)**"]
-    if q[0] > q[1] > q[2]:
-        return [f"최근 3개월({labels[0]} → {labels[2]}) 기준: 출고량 **지속 하락** 흐름 → **하락 예상(룰 기반)**"]
-    return [f"최근 3개월({labels[0]} → {labels[2]}) 기준: 출고량 **혼조/변동** 흐름"]
+    last3 = m.iloc[-3:].copy()
+    q0, q1, q2 = [float(x) if pd.notna(x) else 0.0 for x in last3["qty"].tolist()]
+    l0, l1, l2 = last3["_month_label"].astype(str).tolist()
+
+    # 완전 단조
+    if q0 < q1 < q2:
+        return [f"최근 3개월({l0} → {l2}) 기준: 출고량 **지속 상승** 흐름 ( { _fmt_int(q0) } → { _fmt_int(q2) } )"]
+    if q0 > q1 > q2:
+        return [f"최근 3개월({l0} → {l2}) 기준: 출고량 **지속 하락** 흐름 ( { _fmt_int(q0) } → { _fmt_int(q2) } )"]
+
+    # 패턴 분기
+    # 피크형: 중간월이 가장 큼
+    if q1 >= q0 and q1 >= q2 and (q1 > q0 or q1 > q2):
+        d1 = q1 - q0
+        d2 = q2 - q1
+        return [f"최근 3개월({l0} → {l2}) 기준: **상승 후 하락(피크형)** · {l0}→{l1} {_fmt_int(d1)} 증감, {l1}→{l2} {_fmt_int(d2)} 증감"]
+    # 바닥형: 중간월이 가장 작음
+    if q1 <= q0 and q1 <= q2 and (q1 < q0 or q1 < q2):
+        d1 = q1 - q0
+        d2 = q2 - q1
+        return [f"최근 3개월({l0} → {l2}) 기준: **하락 후 반등(바닥형)** · {l0}→{l1} {_fmt_int(d1)} 증감, {l1}→{l2} {_fmt_int(d2)} 증감"]
+
+    # 그 외: 방향성 불명확하지만 수치로 설명
+    mid_vs_avg = q1 - (q0 + q2) / 2
+    sign = "상회" if mid_vs_avg > 0 else "하회" if mid_vs_avg < 0 else "유사"
+    return [f"최근 3개월({l0} → {l2}) 기준: **변동(혼조)** · 중간월({l1})이 양끝 평균 대비 {sign} ({_fmt_int(mid_vs_avg)})"]
 
 def sku_comment_bp_spike(df_sku: pd.DataFrame, spike_factor=1.5, top_n=3) -> list[str]:
     if df_sku.empty or (COL_BP not in df_sku.columns) or (COL_QTY not in df_sku.columns):
@@ -585,7 +610,6 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     spike = spike.sort_values("현재_요청수량", ascending=False, na_position="last")
     spike["현재_요청수량"] = spike["현재_요청수량"].fillna(0).round(0).astype(int)
     spike["이전_요청수량"] = spike["이전_요청수량"].fillna(0).round(0).astype(int)
-
     spike["증가배수"] = pd.to_numeric(spike["증가배수"], errors="coerce").round(2)
     spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
     return spike[cols]
@@ -594,7 +618,6 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
 # ✅ 주차/월간 자동 코멘트 helpers
 # -------------------------
 def _delta_text(diff: float, digits: int = 0) -> str:
-    """+6,638 / -4 등 숫자만 포맷"""
     if pd.isna(diff):
         return "-"
     if digits == 0:
@@ -602,13 +625,11 @@ def _delta_text(diff: float, digits: int = 0) -> str:
     return f"{diff:+,.{digits}f}"
 
 def _delta_arrow(diff: float) -> str:
-    """▲/▼/ -"""
     if pd.isna(diff) or abs(diff) < 1e-12:
         return "-"
     return "▲" if diff > 0 else "▼"
 
 def _fmt_delta_with_arrow(cur: float, prev: float, digits: int = 0, force_int: bool = True) -> str:
-    """요청 포맷: -4 ▼ / +6,638 ▲ / 0 -"""
     if prev is None or pd.isna(prev):
         prev = 0
     if cur is None or pd.isna(cur):
@@ -628,11 +649,6 @@ def _clean_nunique(series: pd.Series) -> int:
     return int(s.dropna().nunique())
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
-    """
-    출고건수:
-    - 주문번호가 있으면 nunique (문서/주문 단위)
-    - 없으면 대표행(True) count
-    """
     if df is None or df.empty:
         return 0
     if COL_ORDER_NO in df.columns:
@@ -642,7 +658,6 @@ def _get_ship_cnt(df: pd.DataFrame) -> int:
     return int(df.shape[0])
 
 def _get_order_cnt(df: pd.DataFrame) -> int:
-    """✅ 발주건수 = 주문번호 distinct (중복 제거) 고정"""
     if df is None or df.empty:
         return 0
     if COL_ORDER_NO not in df.columns:
@@ -698,7 +713,7 @@ def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
         return []
     cat_col = _find_category_col(cur_df)
     if not cat_col:
-        return []  # 컬럼 없으면 조용히 스킵
+        return []
 
     tmp = cur_df.copy()
     tmp[cat_col] = tmp[cat_col].astype(str).str.strip()
@@ -717,40 +732,28 @@ def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
     return [f"카테고리 TOP{top_n}: {desc}"]
 
 def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
-    """
-    추가 제안: 집중도(Top BP/Top SKU) -> 물량 편중 여부
-    """
     if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
         return []
-
     total = float(cur_df[COL_QTY].fillna(0).sum())
     if total <= 0:
         return []
 
     out = []
-
     if COL_BP in cur_df.columns:
         g = cur_df.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False)
         if len(g) >= 1:
-            top1 = float(g.iloc[0])
-            out.append(f"Top BP 집중도: 1위 {top1/total*100:.0f}%")
+            out.append(f"Top BP 집중도: 1위 {float(g.iloc[0])/total*100:.0f}%")
         if len(g) >= 3:
-            top3 = float(g.iloc[:3].sum())
-            out.append(f"Top BP 집중도: 상위3개 {top3/total*100:.0f}%")
+            out.append(f"Top BP 집중도: 상위3개 {float(g.iloc[:3].sum())/total*100:.0f}%")
 
     if all(c in cur_df.columns for c in [COL_ITEM_CODE, COL_ITEM_NAME]):
         g2 = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY].sum().sort_values(ascending=False)
         if len(g2) >= 1:
-            top_sku = float(g2.iloc[0])
-            out.append(f"Top SKU 집중도: 1위 {top_sku/total*100:.0f}%")
+            out.append(f"Top SKU 집중도: 1위 {float(g2.iloc[0])/total*100:.0f}%")
 
-    return out[:2]  # 너무 길어지지 않게 2줄만
+    return out[:2]
 
 def undated_ship_risk_comment(cur_df: pd.DataFrame) -> list[str]:
-    """
-    추가 제안: 출고일 미정 리스크
-    - 출고일자 결측 라인의 수량/비중
-    """
     if cur_df is None or cur_df.empty:
         return []
     if COL_SHIP not in cur_df.columns or COL_QTY not in cur_df.columns:
@@ -770,10 +773,6 @@ def undated_ship_risk_comment(cur_df: pd.DataFrame) -> list[str]:
     return [f"출고일 미정 수량: {_fmt_int(miss_qty)} ({pct:.0f}%)"]
 
 def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> list[str]:
-    """
-    요청 포맷으로 변경:
-    발주건수 -4 ▼ / 출고건수 -4 ▼ / 출고수량 +6,638 ▲ / 평균 리드타임2 -2 ▼
-    """
     cur_order = _get_order_cnt(cur_df)
     prev_order = _get_order_cnt(prev_df)
 
@@ -826,15 +825,10 @@ def load_raw_from_gsheet() -> pd.DataFrame:
         [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_WEEK_LABEL, COL_CLASS, COL_MAIN, COL_ORDER_NO]
     )
 
-    if COL_MAIN in df.columns:
-        df["_is_rep"] = to_bool_true(df[COL_MAIN])
-    else:
-        df["_is_rep"] = False
+    df["_is_rep"] = to_bool_true(df[COL_MAIN]) if COL_MAIN in df.columns else False
 
-    # ✅ 주차 라벨(유령 방지): 출고일자 우선, 없으면 작업완료일
     df["_week_label"] = df.apply(build_week_label_from_row_safe, axis=1)
 
-    # 월 라벨(년/월1)
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce")
@@ -845,7 +839,6 @@ def load_raw_from_gsheet() -> pd.DataFrame:
     else:
         df["_month_label"] = None
 
-    # ✅ 비교/정렬용 numeric key
     df["_week_key_num"] = df["_week_label"].apply(lambda x: week_key_num_from_label(x) if pd.notna(x) else None)
     df["_month_key_num"] = df["_month_label"].apply(lambda x: month_key_num_from_label(x) if pd.notna(x) else None)
 
@@ -857,7 +850,6 @@ def load_raw_from_gsheet() -> pd.DataFrame:
 st.title("📦 B2B 출고 대시보드")
 st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
 
-# ✅ 새로고침: 캐시 + 메뉴 상태 리셋(기본: SKU별 조회)
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
     reset_keys = [
@@ -879,14 +871,13 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
-# 제품분류 B0/B1 고정
 if COL_CLASS in raw.columns:
     raw = raw[raw[COL_CLASS].astype(str).str.strip().isin(KEEP_CLASSES)].copy()
 else:
     st.warning(f"'{COL_CLASS}' 컬럼이 없어 제품분류(B0/B1) 고정 필터를 적용할 수 없습니다.")
 
 # =========================
-# Sidebar filters (cascading)
+# Sidebar filters
 # =========================
 st.sidebar.header("필터")
 st.sidebar.caption("제품분류 고정: B0, B1")
@@ -1150,7 +1141,7 @@ if nav == "① SKU별 조회":
 # ② 주차요약
 # =========================
 elif nav == "② 주차요약":
-    st.subheader("주차 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
+    st.subheader("주차요약")
 
     d = df_view.copy()
     if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "주차요약"):
@@ -1163,10 +1154,10 @@ elif nav == "② 주차요약":
         st.info("주차 목록이 없습니다.")
         st.stop()
 
+    # ✅ 상단은 선택 UI만
     sel_week = st.selectbox("주차 선택", week_list, index=len(week_list) - 1, key="wk_sel_week")
     wdf = d[d["_week_label"].astype(str) == str(sel_week)].copy()
 
-    # ✅ 주간 자동 코멘트(신규 BP + 전주 대비 + 카테고리 TOP + 집중도/리스크)
     cur_key_num = week_key_num_from_label(sel_week)
     cur_idx = week_list.index(sel_week) if sel_week in week_list else None
 
@@ -1188,6 +1179,9 @@ elif nav == "② 주차요약":
     if prev_week:
         st.caption(f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week})")
     st.divider()
+
+    # ✅ Top10 제목을 표 바로 위로 이동
+    st.subheader("주차 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
 
     top10 = (
         wdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
@@ -1251,7 +1245,7 @@ elif nav == "② 주차요약":
 # ③ 월간요약
 # =========================
 elif nav == "③ 월간요약":
-    st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
+    st.subheader("월간요약")
 
     d = df_view.copy()
     if not need_cols(d, [COL_QTY, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], "월간요약"):
@@ -1265,10 +1259,10 @@ elif nav == "③ 월간요약":
         st.info("월 목록이 없습니다. RAW의 '년', '월1' 컬럼을 확인해 주세요.")
         st.stop()
 
+    # ✅ 상단은 선택 UI만
     sel_month_label2 = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
     mdf = d[d["_month_label"].astype(str) == str(sel_month_label2)].copy()
 
-    # ✅ 월간 자동 코멘트(신규 BP + 전월 대비 + 카테고리 TOP + 집중도/리스크)
     cur_key_num = month_key_num_from_label(sel_month_label2)
     cur_idx = month_list.index(sel_month_label2) if sel_month_label2 in month_list else None
 
@@ -1290,6 +1284,9 @@ elif nav == "③ 월간요약":
     if prev_month:
         st.caption(f"※ 비교 기준: 선택 월({sel_month_label2}) vs 전월({prev_month})")
     st.divider()
+
+    # ✅ Top10 제목을 표 바로 위로 이동
+    st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
 
     top10 = (
         mdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
@@ -1428,5 +1425,4 @@ elif nav == "⑤ BP명별 조회":
         number_cols=["요청수량_합", "출고건수", "집계행수_표본"],
     )
 
-# Footer
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
