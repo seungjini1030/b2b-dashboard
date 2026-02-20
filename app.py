@@ -900,7 +900,8 @@ def _sku_mom_change_lines(cur_df: pd.DataFrame, prev_df: pd.DataFrame, top_n: in
         code = str(r[COL_ITEM_CODE]).strip()
         name = str(r[COL_ITEM_NAME]).strip()
         pct = float(r["pct"])
-        out.append(f"- {code} {name} : {pct:+.0f}%")
+        out.append(f"- {code} {name} : {pct:+.0f}% ({prev_qty:,} → {cur_qty:,})"
+        )
     return out
 
 def _jp_cn_excluded_increase(cur_df: pd.DataFrame, prev_df: pd.DataFrame, jp_cn_tokens: list[str], top_n: int = 5) -> list[str]:
@@ -1913,3 +1914,4 @@ elif nav == "⑤ BP명별 조회":
     )
 
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
+
