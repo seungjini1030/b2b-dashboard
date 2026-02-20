@@ -3,8 +3,9 @@
 # - 메뉴 순서: ① SKU별 조회 -> ② 주차요약 -> ③ 월간요약 -> ④ 국가별 조회 -> ⑤ BP명별 조회
 # - SKU별 조회 UI: 품목코드 검색(상단) -> 누적 SKU Top10(하단)
 # - SKU 자동 코멘트(룰 기반): MoM(2개월), 추이(3개월), BP 급증 사례(월단위)
-# - 코멘트 UI: 타이틀/내용 간격 HTML로 강제(가독성 개선)
+# - 코멘트 UI: 타이틀/내용 간격 HTML+CSS로 강제(가독성 개선)
 # - 주차 라벨: 출고일자 우선(없으면 작업완료일)로 산정하여 유령 주차 방지
+# - 전주/전월 +30% 급증 리포트: dtype(object) 에러 방지(증가배수 numeric 강제)
 # ==========================================
 
 import re
@@ -128,9 +129,13 @@ table.pretty-table{
 .mono {font-variant-numeric: tabular-nums;}
 hr {margin: 1.2rem 0;}
 
-/* 코멘트 가독성 */
-.comment {margin: 0.35rem 0 0 0; line-height: 1.55;}
-.comment-title {font-weight: 800; font-size: 1.02rem;}
+/* 코멘트 가독성 (✅ 타이틀-내용 간격 확실히 벌림) */
+.comment {margin: 0.55rem 0 0 0; line-height: 1.65;}
+.comment-title {
+  font-weight: 900;
+  font-size: 1.06rem;
+  margin: 0.85rem 0 0.95rem 0;
+}
 </style>
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
@@ -326,7 +331,7 @@ def render_numbered_block(title: str, items: list[str]):
 
     st.markdown(
         f"""
-        <div class="comment-title" style="margin-top:0.4rem; margin-bottom:0.7rem;">
+        <div class="comment-title">
             {html.escape(title)}
         </div>
         """,
@@ -336,7 +341,7 @@ def render_numbered_block(title: str, items: list[str]):
     for i, line in enumerate(items, start=1):
         st.markdown(
             f"""
-            <div class='comment' style="margin-bottom:0.45rem;">
+            <div class='comment'>
                 {i}) {line}
             </div>
             """,
@@ -415,6 +420,7 @@ def sku_comment_bp_spike(df_sku: pd.DataFrame, spike_factor=1.5, top_n=3) -> lis
         sub = sub.sort_values("_month_key")
         if len(sub) < 2:
             continue
+
         for _, r in sub.iterrows():
             cur_month = r["_month_label"]
             cur_qty = float(r["m_qty"]) if pd.notna(r["m_qty"]) else 0.0
@@ -544,10 +550,11 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     ) if not prev_df.empty else pd.DataFrame(columns=[COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량"])
 
     cmp = cur_sku.merge(prev_sku, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
-    cmp["이전_요청수량"] = cmp["이전_요청수량"].fillna(0)
+    cmp["이전_요청수량"] = pd.to_numeric(cmp["이전_요청수량"], errors="coerce").fillna(0)
+    cmp["현재_요청수량"] = pd.to_numeric(cmp["현재_요청수량"], errors="coerce").fillna(0)
 
     cmp["증가배수"] = cmp.apply(
-        lambda r: (r["현재_요청수량"] / r["이전_요청수량"]) if r["이전_요청수량"] > 0 else None,
+        lambda r: (r["현재_요청수량"] / r["이전_요청수량"]) if r["이전_요청수량"] > 0 else pd.NA,
         axis=1
     )
 
@@ -559,7 +566,10 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     spike = spike.sort_values("현재_요청수량", ascending=False, na_position="last")
     spike["현재_요청수량"] = spike["현재_요청수량"].fillna(0).round(0).astype(int)
     spike["이전_요청수량"] = spike["이전_요청수량"].fillna(0).round(0).astype(int)
-    spike["증가배수"] = spike["증가배수"].round(2)
+
+    # ✅ object dtype 방지
+    spike["증가배수"] = pd.to_numeric(spike["증가배수"], errors="coerce").round(2)
+
     spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
     return spike[cols]
 
@@ -595,9 +605,10 @@ def load_raw_from_gsheet() -> pd.DataFrame:
     else:
         df["_is_rep"] = False
 
-    # ✅ 주차/월 라벨 생성
+    # ✅ 주차 라벨(유령 방지): 출고일자 우선, 없으면 작업완료일
     df["_week_label"] = df.apply(build_week_label_from_row_safe, axis=1)
 
+    # 월 라벨(년/월1)
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce")
