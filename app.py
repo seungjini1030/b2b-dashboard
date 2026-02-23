@@ -1,8 +1,9 @@
 # ==========================================
 # B2B 출고 대시보드 (Google Sheet 기반)
-# - ✅ 출고 캘린더: 구글캘린더처럼 일자별 네모박스 경계 + BP 클릭 1번 → 상세 즉시 표시
-# - ✅ 캘린더 HTML이 화면에 코드로 출력되는 문제 해결:
-#    st.markdown(unsafe_allow_html) 대신 components.html 로 안정 렌더링 + 링크 target="_top"
+# - ✅ 출고 캘린더: 일자별 네모 경계 + BP 클릭 1번 → 상세 즉시 표시
+# - ✅ iframe 환경에서 링크 클릭이 안 먹는 케이스 해결:
+#    <a href> 대신 JS로 window.parent.location 강제 이동
+# - ✅ 해외B2B pill 색상 분리(국내B2B와 구별)
 # ==========================================
 
 import re
@@ -38,7 +39,6 @@ COL_ORDER_NO = "주문번호"
 INVOICE_COL_CANDIDATES = ["인보이스No.", "인보이스번호", "Invoice No.", "InvoiceNo", "invoice_no", "INVOICE_NO"]
 
 KEEP_CLASSES = ["B0", "B1"]
-LT_ONLY_CUST1 = "해외B2B"
 SPIKE_FACTOR = 1.3  # +30%
 
 # =========================
@@ -61,21 +61,6 @@ BASE_CSS = """
 .block-container {padding-top: 1.2rem; padding-bottom: 2.5rem;}
 h1, h2, h3 {letter-spacing: -0.2px;}
 .small-note {color:#6b7280; font-size: 0.9rem;}
-
-.kpi-wrap {display:flex; gap:0.75rem; flex-wrap:wrap; margin: 0.25rem 0 0.75rem 0;}
-.kpi-card {
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-  padding: 0.9rem 0.95rem;
-  min-width: 180px;
-  flex: 1 1 180px;
-  box-shadow: 0 1px 0 rgba(0,0,0,0.02);
-}
-.kpi-title {color:#6b7280; font-size:0.9rem; margin-bottom:0.35rem;}
-.kpi-value {font-size:1.35rem; font-weight:700; color:#111827; line-height:1.2;}
-.kpi-big {font-size:1.55rem; font-weight:800; color:#111827; line-height:1.15;}
-.kpi-muted {color:#6b7280; font-size:0.85rem; margin-top:0.15rem; white-space:normal; word-break:break-word;}
 
 .mini-kpi-wrap{display:flex; gap:0.6rem; flex-wrap:wrap; margin:0.55rem 0 0.25rem 0;}
 .mini-kpi{
@@ -132,22 +117,11 @@ table.pretty-table{
 .wrap {white-space: normal; word-break: break-word; line-height: 1.25rem;}
 .mono {font-variant-numeric: tabular-nums;}
 hr {margin: 1.2rem 0;}
-
-.comment-block { margin: 0.6rem 0 1.05rem 0; }
-.comment-title{
-  font-weight: 900;
-  font-size: 1.06rem;
-  margin: 0.2rem 0 0.25rem 0;
-}
-.comment{
-  margin: 0.08rem 0 0 0;
-  line-height: 1.55;
-}
 </style>
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-# ✅ 캘린더는 components.html(iframe) 안에서 렌더링되므로, 캘린더 전용 CSS를 HTML 안에 포함해야 함
+# ✅ 캘린더는 components.html(iframe) 안에서 렌더링되므로, 캘린더 전용 CSS/JS를 HTML 안에 포함
 CAL_CSS = """
 <style>
 .cal-wrap{border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; background:#fff;}
@@ -169,6 +143,8 @@ CAL_CSS = """
 .cal-daynum{font-weight:900; color:#111827; font-size:0.95rem; margin-bottom:6px;}
 .cal-out{background:#fafafa; color:#9ca3af;}
 .cal-events{display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto; padding-right:2px;}
+
+/* 기본 pill */
 .cal-pill{
   display:block;
   width:100%;
@@ -181,10 +157,62 @@ CAL_CSS = """
   font-size:0.86rem;
   line-height:1.15rem;
   box-sizing:border-box;
+  cursor:pointer;
 }
 .cal-pill:hover{background:#f7fbff; border-color:#cfe5ff;}
 .cal-pill .q{color:#374151; font-variant-numeric: tabular-nums; font-weight:800;}
+
+/* ✅ 해외B2B 색상(보라 톤) */
+.cal-pill.over{
+  background:#f5f3ff;
+  border-color:#ddd6fe;
+}
+.cal-pill.over:hover{
+  background:#ede9fe;
+  border-color:#c4b5fd;
+}
+
+/* ✅ 국내B2B 색상(연한 블루 톤) */
+.cal-pill.dom{
+  background:#eff6ff;
+  border-color:#bfdbfe;
+}
+.cal-pill.dom:hover{
+  background:#dbeafe;
+  border-color:#93c5fd;
+}
+
+.cal-legend{
+  display:flex; gap:10px; align-items:center; margin:10px 2px 0 2px; color:#6b7280; font-size:0.88rem;
+}
+.badge{
+  display:inline-flex; align-items:center; gap:6px;
+}
+.dot{
+  width:10px; height:10px; border-radius:999px; display:inline-block;
+}
+.dot.over{background:#7c3aed;}
+.dot.dom{background:#2563eb;}
 </style>
+"""
+
+# ✅ iframe 안에서 클릭 시 상위 앱 URL을 강제 변경 (href 네비게이션이 막히는 환경 대응)
+CAL_JS = """
+<script>
+function goTo(url){
+  try{
+    // Streamlit components iframe 환경에서 가장 잘 먹는 방식
+    window.parent.location.href = url;
+  }catch(e){
+    try{
+      window.top.location.href = url;
+    }catch(e2){
+      // 최후 fallback: 새 창
+      window.open(url, "_blank");
+    }
+  }
+}
+</script>
 """
 
 # -------------------------
@@ -322,59 +350,7 @@ def get_invoice_col(df: pd.DataFrame) -> str | None:
     return None
 
 # -------------------------
-# Label helpers
-# -------------------------
-def make_month_label(year: int, month: int) -> str:
-    return f"{int(year)}년 {int(month)}월"
-
-def parse_month_label_key(label: str) -> tuple[int, int]:
-    y = m = 0
-    try:
-        my = re.search(r"(\d{4})\s*년", str(label))
-        mm = re.search(r"(\d+)\s*월", str(label))
-        if my: y = int(my.group(1))
-        if mm: m = int(mm.group(1))
-    except Exception:
-        pass
-    return (y, m)
-
-def week_label_from_date(dt: pd.Timestamp) -> str | None:
-    if pd.isna(dt):
-        return None
-    y = int(dt.year)
-    m = int(dt.month)
-    d = int(dt.day)
-    wk = (d - 1) // 7 + 1
-    return f"{y}년 {m}월 {wk}주차"
-
-def build_week_label_from_row_safe(row: pd.Series) -> str | None:
-    ship_dt = row.get(COL_SHIP, pd.NaT)
-    done_dt = row.get(COL_DONE, pd.NaT)
-    base_dt = ship_dt if pd.notna(ship_dt) else done_dt
-    if pd.notna(base_dt):
-        return week_label_from_date(pd.to_datetime(base_dt, errors="coerce"))
-    return None
-
-def week_key_num_from_label(label: str) -> int | None:
-    try:
-        my = re.search(r"(\d{4})\s*년", str(label))
-        mm = re.search(r"(\d+)\s*월", str(label))
-        mw = re.search(r"(\d+)\s*주차", str(label))
-        if not (my and mm and mw):
-            return None
-        y = int(my.group(1)); m = int(mm.group(1)); w = int(mw.group(1))
-        return y * 10000 + m * 100 + w
-    except Exception:
-        return None
-
-def month_key_num_from_label(label: str) -> int | None:
-    y, m = parse_month_label_key(label)
-    if y <= 0 or m <= 0:
-        return None
-    return y * 100 + m
-
-# -------------------------
-# ✅ 출고 캘린더 helpers (핵심 수정)
+# Query params helpers
 # -------------------------
 def _qp_get() -> dict:
     try:
@@ -391,6 +367,9 @@ def _qp_set(**kwargs):
     except Exception:
         st.experimental_set_query_params(**clean)
 
+# -------------------------
+# Shipment doc key (해외는 인보이스 / 국내는 주문번호)
+# -------------------------
 def _ship_doc_key(df: pd.DataFrame) -> pd.Series:
     inv_col = get_invoice_col(df)
     cust = df[COL_CUST1].astype(str).str.strip() if COL_CUST1 in df.columns else pd.Series([""] * len(df))
@@ -411,11 +390,14 @@ def _cal_month_bounds(y: int, m: int) -> tuple[pd.Timestamp, pd.Timestamp]:
     end = pd.Timestamp(datetime(y, m, last_day))
     return start, end
 
+# -------------------------
+# ✅ Calendar renderer (핵심 수정)
+# -------------------------
 def render_ship_calendar(df_cal: pd.DataFrame, y: int, m: int):
     """
-    ✅ 기존 에러(HTML이 그대로 글자로 출력됨) 방지:
-    - st.markdown(unsafe_allow_html) 대신 components.html 사용
-    - 링크는 iframe 내부에서도 상위 페이지로 이동하도록 target="_top"
+    - ✅ 일자별 네모 경계
+    - ✅ 해외/국내 pill 색상 구분
+    - ✅ 클릭 1번으로 상세 이동: JS로 window.parent.location 강제 변경
     """
     if not need_cols(df_cal, [COL_SHIP, COL_BP, COL_QTY, COL_CUST1], "출고 캘린더"):
         return
@@ -431,66 +413,70 @@ def render_ship_calendar(df_cal: pd.DataFrame, y: int, m: int):
         st.info("선택한 월에 출고 데이터가 없습니다.")
         return
 
-    day_bp = (
-        base_m.groupby(["_ship_date", COL_BP], dropna=False)[COL_QTY]
-        .sum(min_count=1)
-        .reset_index()
-        .rename(columns={COL_QTY: "qty"})
-    )
+    # ✅ day-bp 집계 + 해외B2B 포함 여부
+    grp = base_m.groupby(["_ship_date", COL_BP], dropna=False)
+    day_bp = grp[COL_QTY].sum(min_count=1).reset_index().rename(columns={COL_QTY: "qty"})
     day_bp["qty"] = pd.to_numeric(day_bp["qty"], errors="coerce").fillna(0)
+
+    # 해외B2B 포함 플래그
+    flag = grp[COL_CUST1].apply(lambda s: (s.astype(str).str.strip() == "해외B2B").any()).reset_index(name="is_overseas")
+    day_bp = day_bp.merge(flag, on=["_ship_date", COL_BP], how="left")
+    day_bp["is_overseas"] = day_bp["is_overseas"].fillna(False)
 
     first_weekday_mon0 = datetime(y, m, 1).weekday()  # Mon=0
     last_day = pycal.monthrange(y, m)[1]
-
     week_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     idx = {}
     for d, sub in day_bp.groupby("_ship_date"):
         s = sub.sort_values("qty", ascending=False)
-        idx[d] = [(str(r[COL_BP]).strip(), float(r["qty"])) for _, r in s.iterrows()]
+        idx[d] = [(str(r[COL_BP]).strip(), float(r["qty"]), bool(r["is_overseas"])) for _, r in s.iterrows()]
 
     cells_html = []
-    # 앞쪽 빈 칸
     for _ in range(first_weekday_mon0):
         cells_html.append('<div class="cal-cell cal-out"><div class="cal-daynum"> </div></div>')
 
-    # 날짜 칸
     for day in range(1, last_day + 1):
         d = date(y, m, day)
         events = idx.get(d, [])
         ev_html = ['<div class="cal-events">']
-        for (bp, qty) in events:
-            href = f"?view=bp&y={y}&m={m}&d={quote(d.strftime('%Y-%m-%d'))}&bp={quote(bp)}"
+        for (bp, qty, is_over) in events:
+            # 상세 URL
+            url = f"?view=bp&y={y}&m={m}&d={quote(d.strftime('%Y-%m-%d'))}&bp={quote(bp)}"
+            klass = "over" if is_over else "dom"
+            # ✅ href는 무의미 처리 + onclick으로 상위 URL 이동
             ev_html.append(
-                f'<a class="cal-pill" target="_top" href="{href}">'
+                f'<a class="cal-pill {klass}" href="javascript:void(0)" '
+                f'onclick="goTo(\\\"{url}\\\")">'
                 f'{html.escape(bp)} / <span class="q">{int(round(qty)):,}</span></a>'
             )
         ev_html.append("</div>")
+        cells_html.append(f'<div class="cal-cell"><div class="cal-daynum">{day}</div>{"".join(ev_html)}</div>')
 
-        cells_html.append(
-            f'<div class="cal-cell"><div class="cal-daynum">{day}</div>{"".join(ev_html)}</div>'
-        )
-
-    # 뒤쪽 빈 칸
     while len(cells_html) % 7 != 0:
         cells_html.append('<div class="cal-cell cal-out"><div class="cal-daynum"> </div></div>')
 
     head_html = "".join([f'<div class="cal-head">{w}</div>' for w in week_names])
 
     calendar_html = f"""
+    {CAL_JS}
     <div class="cal-wrap">
       <div class="cal-grid">
         {head_html}
         {''.join(cells_html)}
       </div>
     </div>
+
+    <div class="cal-legend">
+      <span class="badge"><span class="dot dom"></span>국내 B2B</span>
+      <span class="badge"><span class="dot over"></span>해외 B2B</span>
+    </div>
     """
 
     full_html = CAL_CSS + calendar_html
-    # 높이는 월별로 넉넉히(6주까지 커버)
-    components.html(full_html, height=880, scrolling=True)
+    components.html(full_html, height=930, scrolling=True)
 
-    st.caption("※ 캘린더 셀은 BP명/요청수량합만 표시됩니다. (BP 클릭 1번으로 하단 상세가 즉시 표시됩니다.)")
+    st.caption("※ 캘린더 셀은 BP명/요청수량합만 표시됩니다. BP 클릭 1번으로 하단 상세가 즉시 표시됩니다.")
 
 def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str):
     if not need_cols(df_cal, [COL_SHIP, COL_BP, COL_QTY, COL_CUST1], "출고건 상세"):
@@ -516,7 +502,7 @@ def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str
     st.markdown("### 📦 출고건 상세")
     st.markdown(f"- **일자:** {ship_date_str}")
     st.markdown(f"- **BP명:** {html.escape(bp)}")
-    st.caption("※ 캘린더 상세는 출고건(인보이스/주문번호) 단위로 전체 품목라인을 즉시 펼쳐 보여줍니다. (추가 클릭 없음)")
+    st.caption("※ 출고건(해외=인보이스 / 국내=주문번호) 단위로 품목라인 전체를 즉시 펼쳐 보여줍니다.")
 
     sum_df = (
         base.groupby([COL_CUST1, "_ship_doc"], dropna=False)
@@ -589,29 +575,13 @@ def load_raw_from_gsheet() -> pd.DataFrame:
         [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_CLASS, COL_MAIN, COL_ORDER_NO]
     )
 
-    df["_is_rep"] = to_bool_true(df[COL_MAIN]) if COL_MAIN in df.columns else False
-    df["_week_label"] = df.apply(build_week_label_from_row_safe, axis=1)
-
-    if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
-        y = pd.to_numeric(df[COL_YEAR], errors="coerce")
-        m = pd.to_numeric(df[COL_MONTH], errors="coerce")
-        df["_month_label"] = [
-            make_month_label(yy, mm) if pd.notna(yy) and pd.notna(mm) else None
-            for yy, mm in zip(y, m)
-        ]
-    else:
-        df["_month_label"] = None
-
-    df["_week_key_num"] = df["_week_label"].apply(lambda x: week_key_num_from_label(x) if pd.notna(x) else None)
-    df["_month_key_num"] = df["_month_label"].apply(lambda x: month_key_num_from_label(x) if pd.notna(x) else None)
-
     return df
 
 # -------------------------
 # Main
 # -------------------------
 st.title("📦 B2B 출고 대시보드")
-st.caption("Google Sheet RAW 기반 | 기본 집계 제품분류 B0/B1 고정(기본) | 캘린더 상세는 출고건 단위 전체 품목라인 표시")
+st.caption("Google Sheet RAW 기반 | 기본 집계 제품분류 B0/B1 | 캘린더 상세는 출고건 단위 전체 품목라인 표시")
 
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
@@ -653,31 +623,6 @@ if sel_cust2 != "전체" and COL_CUST2 in pool2.columns:
 if sel_cust2 != "전체" and COL_CUST2 in pool2_all.columns:
     pool2_all = pool2_all[pool2_all[COL_CUST2].astype(str).str.strip() == sel_cust2]
 
-month_labels = []
-if "_month_label" in pool2.columns:
-    month_labels = [x for x in pool2["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
-    month_labels = sorted(list(dict.fromkeys(month_labels)), key=parse_month_label_key)
-
-sel_month_label = st.sidebar.selectbox("월", ["전체"] + month_labels, index=0)
-
-pool3 = pool2.copy()
-pool3_all = pool2_all.copy()
-if sel_month_label != "전체":
-    pool3 = pool3[pool3["_month_label"].astype(str) == str(sel_month_label)]
-    pool3_all = pool3_all[pool3_all["_month_label"].astype(str) == str(sel_month_label)]
-
-bp_list = uniq_sorted(pool3, COL_BP)
-sel_bp = st.sidebar.selectbox("BP명", ["전체"] + bp_list, index=0)
-
-df_view = pool3.copy()
-df_view_all = pool3_all.copy()
-if sel_bp != "전체" and COL_BP in df_view.columns:
-    df_view = df_view[df_view[COL_BP].astype(str).str.strip() == sel_bp]
-if sel_bp != "전체" and COL_BP in df_view_all.columns:
-    df_view_all = df_view_all[df_view_all[COL_BP].astype(str).str.strip() == sel_bp]
-
-st.divider()
-
 # =========================
 # Navigation
 # =========================
@@ -692,21 +637,24 @@ nav = st.radio(
 # =========================
 if nav == "① 출고 캘린더":
     st.subheader("📅 출고 캘린더")
-    st.caption("캘린더 셀은 BP명/요청수량합만 표시됩니다. BP 클릭 1번으로 출고건(인보이스/주문번호) 상세가 즉시 펼쳐집니다.")
+    st.caption("캘린더 셀은 BP명/요청수량합만 표시됩니다. BP 클릭 1번으로 출고건(해외=인보이스/국내=주문번호) 상세가 즉시 표시됩니다.")
 
     qp = _qp_get()
-    view = (qp.get("view", ["cal"])[0] if isinstance(qp.get("view"), list) else qp.get("view")) or "cal"
-    qp_y = (qp.get("y", [None])[0] if isinstance(qp.get("y"), list) else qp.get("y"))
-    qp_m = (qp.get("m", [None])[0] if isinstance(qp.get("m"), list) else qp.get("m"))
-    qp_d = (qp.get("d", [None])[0] if isinstance(qp.get("d"), list) else qp.get("d"))
-    qp_bp = (qp.get("bp", [None])[0] if isinstance(qp.get("bp"), list) else qp.get("bp"))
+
+    def _qp_one(key: str, default=None):
+        v = qp.get(key, default)
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v if v is not None else default
+
+    view = _qp_one("view", "cal") or "cal"
+    qp_y = _qp_one("y", None)
+    qp_m = _qp_one("m", None)
+    qp_d = _qp_one("d", None)
+    qp_bp = _qp_one("bp", None)
 
     today = date.today()
     default_y, default_m = today.year, today.month
-    if sel_month_label != "전체":
-        yy, mm = parse_month_label_key(sel_month_label)
-        if yy > 0 and mm > 0:
-            default_y, default_m = yy, mm
 
     try:
         y0 = int(qp_y) if qp_y else default_y
@@ -731,7 +679,7 @@ if nav == "① 출고 캘린더":
 
     st.divider()
 
-    df_cal_base = df_view_all.copy()
+    df_cal_base = pool2_all.copy()
 
     if view == "cal":
         render_ship_calendar(df_cal_base, int(cal_y), int(cal_m))
@@ -745,4 +693,4 @@ if nav == "① 출고 캘린더":
             render_bp_shipments_detail(df_cal_base, ship_date_str=ship_date_str, bp=bp)
 
 else:
-    st.info("현재 메시지에서는 캘린더 버그 수정본만 전달했어요. (나머지 메뉴 탭 코드가 필요하면 말씀해줘요)")
+    st.info("이 버전은 캘린더 UX/상세 연결에 집중한 코드입니다. 다른 탭 로직까지 합친 완전체에 이 패치를 이식하려면 기존 app.py 원문이 필요해요.")
