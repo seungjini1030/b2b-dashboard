@@ -5,7 +5,7 @@
 #    - 구글캘린더처럼 일자별 네모 경계(그리드)
 #    - 해외B2B/국내B2B 색상 구분
 #    - BP pill 클릭 1번 → 상세(해당 BP의 출고내역) 즉시 표시 (iframe URL 이동 버그 해결)
-#    - 상세는 "출고건 단위(문서/주문번호/인보이스)"로 전체 품목라인 표시
+#    - ✅ (추가) BP 상세에서 출고건ID(해외=인보이스No / 국내=주문번호) 클릭 → 해당 출고건 품목라인 상세로 드릴다운
 #
 # - 기존 기능(승진님 제공 코드) 전부 유지:
 #   - SKU별 조회 UI: 품목코드 검색(상단) -> 누적 SKU Top10(하단)
@@ -1248,6 +1248,12 @@ def _ship_doc_key(df: pd.DataFrame) -> pd.Series:
     out = out.fillna(ordno.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}))
     return out.astype(str)
 
+def _sanitize_key(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = re.sub(r"\s+", "_", s.strip())
+    s = re.sub(r"[^0-9a-zA-Z가-힣_:\-\.]", "_", s)
+    return s[:160] if len(s) > 160 else s
+
 def render_ship_calendar(df_cal: pd.DataFrame, y: int, m: int):
     if not need_cols(df_cal, [COL_SHIP, COL_BP, COL_QTY, COL_CUST1], "출고 캘린더"):
         return
@@ -1320,11 +1326,10 @@ def render_ship_calendar(df_cal: pd.DataFrame, y: int, m: int):
     """
     components.html(CAL_CSS + calendar_html, height=930, scrolling=True)
 
-def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str):
+def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str, y: int, m: int):
     """
-    - 선택 일자 + BP에 대해:
-      1) 출고건ID(=인보이스/주문번호) 단위로 요약
-      2) 각 출고건ID 아래에 품목 라인 전체(품목코드/품목명/수량) 표시
+    1단계: 선택 일자 + BP에 대해 출고건ID(=인보이스/주문번호) 요약
+    - 각 출고건ID는 버튼으로 제공 → 클릭 시 mode=doc 으로 드릴다운
     """
     if not need_cols(df_cal, [COL_SHIP, COL_BP, COL_QTY, COL_CUST1, COL_ITEM_CODE, COL_ITEM_NAME], "출고건 상세"):
         return
@@ -1346,11 +1351,12 @@ def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str
     base["_ship_doc"] = _ship_doc_key(base)
     base["_done_dt"] = pd.to_datetime(base[COL_DONE], errors="coerce") if COL_DONE in base.columns else pd.NaT
 
-    st.markdown("### 📦 출고 상세 (출고건 단위 전체 품목라인)")
+    st.markdown("### 📦 BP 출고 상세 (출고건ID 목록)")
     st.markdown(f"- **일자:** {ship_date_str}")
     st.markdown(f"- **BP명:** {html.escape(bp)}")
+    st.caption("아래 출고건ID(해외=인보이스No / 국내=주문번호)를 클릭하면 해당 출고건의 품목라인 상세로 이동합니다.")
+    st.divider()
 
-    # 출고건(문서) 요약
     sum_df = (
         base.groupby([COL_CUST1, "_ship_doc"], dropna=False)
         .agg(
@@ -1370,6 +1376,7 @@ def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str
     render_mini_kpi("요청수량 합산", f"{total_qty:,}")
     st.divider()
 
+    # ✅ 출고건ID 버튼 리스트 + 간단 요약 테이블
     for _, r in sum_df.iterrows():
         section = str(r["구분"]).strip()
         ship_id = str(r["출고건ID"]).strip()
@@ -1377,31 +1384,164 @@ def render_bp_shipments_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str
         line_cnt = int(r["품목라인수"])
         done_str = str(r["작업완료일"])
 
-        st.markdown(f"#### [{section}] {html.escape(ship_id)}")
-        st.markdown(f"- 출고수량 합: **{qty_sum:,}** · 품목라인 {line_cnt:,} · 작업완료일 {done_str}")
+        key = f"docbtn_{_sanitize_key(section)}_{_sanitize_key(ship_id)}_{ship_date_str}"
+        btn_label = f"[{section}] {ship_id}  |  수량 {qty_sum:,}  |  라인 {line_cnt:,}  |  작업완료 {done_str}"
 
-        sub = base[
-            (base[COL_CUST1].astype(str).str.strip() == section) &
-            (base["_ship_doc"].astype(str).str.strip() == ship_id)
-        ].copy()
+        if st.button(btn_label, key=key):
+            _qp_set(
+                view="cal",
+                mode="doc",
+                y=int(y),
+                m=int(m),
+                d=quote(ship_date_str),
+                bp=quote(bp),
+                sec=quote(section),
+                doc=quote(ship_id),
+            )
+            st.rerun()
 
-        items = (
-            sub.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
-            .sum(min_count=1)
-            .reset_index()
-            .rename(columns={COL_QTY: "요청수량"})
-            .sort_values("요청수량", ascending=False, na_position="last")
-        )
-        items["요청수량"] = pd.to_numeric(items["요청수량"], errors="coerce").fillna(0).round(0).astype(int)
+    st.divider()
 
-        render_pretty_table(
-            items[[COL_ITEM_CODE, COL_ITEM_NAME, "요청수량"]],
-            height=360,
-            wrap_cols=[COL_ITEM_NAME],
-            col_width_px={COL_ITEM_CODE: 130, COL_ITEM_NAME: 520, "요청수량": 120},
-            number_cols=["요청수량"],
-        )
-        st.divider()
+    # 참고용: 출고건ID별 품목 요약(기존 유지) - 화면이 길어질 수 있어 접어둠
+    with st.expander("출고건ID별 품목 요약(참고용) 펼치기", expanded=False):
+        for _, r in sum_df.iterrows():
+            section = str(r["구분"]).strip()
+            ship_id = str(r["출고건ID"]).strip()
+
+            st.markdown(f"#### [{section}] {html.escape(ship_id)}")
+
+            sub = base[
+                (base[COL_CUST1].astype(str).str.strip() == section) &
+                (base["_ship_doc"].astype(str).str.strip() == ship_id)
+            ].copy()
+
+            items = (
+                sub.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+                .sum(min_count=1)
+                .reset_index()
+                .rename(columns={COL_QTY: "요청수량"})
+                .sort_values("요청수량", ascending=False, na_position="last")
+            )
+            items["요청수량"] = pd.to_numeric(items["요청수량"], errors="coerce").fillna(0).round(0).astype(int)
+
+            render_pretty_table(
+                items[[COL_ITEM_CODE, COL_ITEM_NAME, "요청수량"]],
+                height=320,
+                wrap_cols=[COL_ITEM_NAME],
+                col_width_px={COL_ITEM_CODE: 130, COL_ITEM_NAME: 520, "요청수량": 120},
+                number_cols=["요청수량"],
+            )
+            st.divider()
+
+def render_shipdoc_detail(df_cal: pd.DataFrame, ship_date_str: str, bp: str, section: str, ship_id: str):
+    """
+    2단계(드릴다운): 특정 출고건ID 1건의 '원본 품목라인 상세' 표시
+    - 해외: 출고건ID = 인보이스No (가능하면)
+    - 국내: 출고건ID = 주문번호
+    """
+    if not need_cols(df_cal, [COL_SHIP, COL_BP, COL_QTY, COL_CUST1, COL_ITEM_CODE, COL_ITEM_NAME], "출고건ID 상세"):
+        return
+
+    d = pd.to_datetime(ship_date_str, errors="coerce")
+    if pd.isna(d):
+        st.warning("선택된 날짜가 올바르지 않습니다.")
+        return
+    d_date = d.date()
+
+    base = df_cal.copy()
+    ship_dt = pd.to_datetime(base[COL_SHIP], errors="coerce").dt.date
+    base = base[(ship_dt == d_date)].copy()
+
+    base = base[
+        (base[COL_BP].astype(str).str.strip() == str(bp).strip()) &
+        (base[COL_CUST1].astype(str).str.strip() == str(section).strip())
+    ].copy()
+
+    if base.empty:
+        st.info("선택 조건에 해당하는 데이터가 없습니다.")
+        return
+
+    base["_ship_doc"] = _ship_doc_key(base)
+    base = base[base["_ship_doc"].astype(str).str.strip() == str(ship_id).strip()].copy()
+
+    if base.empty:
+        st.info("선택한 출고건ID가 현재 필터 범위에서 조회되지 않습니다.")
+        return
+
+    inv_col = get_invoice_col(base)
+
+    st.markdown("### 🔎 출고건ID 상세 (품목라인 원본)")
+    st.markdown(f"- **일자:** {ship_date_str}")
+    st.markdown(f"- **BP명:** {html.escape(bp)}")
+    st.markdown(f"- **구분:** {html.escape(section)}")
+    st.markdown(f"- **출고건ID:** {html.escape(ship_id)}")
+    st.divider()
+
+    # 표시할 컬럼 구성(있는 것만)
+    show_cols = []
+    # 기본
+    for c in [COL_CUST1, COL_CUST2, COL_BP, COL_SHIP, COL_DONE]:
+        if c in base.columns and c not in show_cols:
+            show_cols.append(c)
+
+    # 해외/국내 핵심 식별자
+    if inv_col and inv_col in base.columns and inv_col not in show_cols:
+        show_cols.append(inv_col)
+    if COL_ORDER_NO in base.columns and COL_ORDER_NO not in show_cols:
+        show_cols.append(COL_ORDER_NO)
+
+    # 품목 라인
+    for c in [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY]:
+        if c in base.columns and c not in show_cols:
+            show_cols.append(c)
+
+    # 리드타임 등(있으면)
+    for c in [COL_LT2, COL_ORDER_DATE]:
+        if c in base.columns and c not in show_cols:
+            show_cols.append(c)
+
+    # 보기 좋게 전처리
+    if COL_QTY in base.columns:
+        base[COL_QTY] = pd.to_numeric(base[COL_QTY], errors="coerce").fillna(0).round(0).astype(int)
+
+    # 날짜 포맷용 복사 컬럼(테이블 표시용)
+    disp = base.copy()
+    for c in [COL_SHIP, COL_DONE, COL_ORDER_DATE]:
+        if c in disp.columns:
+            disp[c] = pd.to_datetime(disp[c], errors="coerce").apply(fmt_date)
+
+    # 정렬(수량 desc, 품목코드)
+    sort_cols = []
+    if COL_QTY in disp.columns:
+        sort_cols.append(COL_QTY)
+    if COL_ITEM_CODE in disp.columns:
+        sort_cols.append(COL_ITEM_CODE)
+    if sort_cols:
+        disp = disp.sort_values(sort_cols, ascending=[False] + [True] * (len(sort_cols) - 1), na_position="last")
+
+    total_qty = int(disp[COL_QTY].sum()) if COL_QTY in disp.columns else 0
+    render_mini_kpi("요청수량 합산", f"{total_qty:,}")
+    st.divider()
+
+    render_pretty_table(
+        disp[show_cols],
+        height=520,
+        wrap_cols=[COL_ITEM_NAME, COL_BP, COL_CUST2],
+        col_width_px={
+            COL_CUST1: 110,
+            COL_CUST2: 160,
+            COL_BP: 220,
+            COL_ITEM_CODE: 130,
+            COL_ITEM_NAME: 520,
+            COL_QTY: 120,
+            COL_SHIP: 120,
+            COL_DONE: 120,
+            COL_ORDER_NO: 150,
+            COL_ORDER_DATE: 120,
+            COL_LT2: 90,
+        },
+        number_cols=[COL_QTY, COL_LT2],
+    )
 
 # -------------------------
 # Load RAW
@@ -1471,7 +1611,7 @@ if st.button("🔄 데이터 새로고침"):
     # ✅ 기본 메뉴: 캘린더
     st.session_state["nav_menu"] = "① 출고 캘린더"
     # ✅ query도 캘린더 기본으로
-    _qp_set(view="cal", mode=None, y=None, m=None, d=None, bp=None)
+    _qp_set(view="cal", mode=None, y=None, m=None, d=None, bp=None, sec=None, doc=None)
     st.rerun()
 
 try:
@@ -1607,15 +1747,20 @@ nav = st.radio(
 # =========================
 if nav == "① 출고 캘린더":
     st.subheader("📅 출고 캘린더")
-    st.caption("캘린더 셀은 BP명/요청수량합만 표시됩니다. BP 클릭 1번으로 상세(출고건 단위 전체 품목라인)가 즉시 표시됩니다.")
+    st.caption("캘린더 셀은 BP명/요청수량합만 표시됩니다. BP 클릭 1번으로 상세(출고건ID 목록)가 즉시 표시되며, 출고건ID 클릭 시 품목라인 상세로 이동합니다.")
 
     qp = _qp_get()
     view = _qp_one(qp, "view", "cal") or "cal"
     mode = _qp_one(qp, "mode", None)
+
     qp_y = _qp_one(qp, "y", None)
     qp_m = _qp_one(qp, "m", None)
     qp_d = _qp_one(qp, "d", None)
     qp_bp = _qp_one(qp, "bp", None)
+
+    # ✅ 드릴다운용
+    qp_sec = _qp_one(qp, "sec", None)
+    qp_doc = _qp_one(qp, "doc", None)
 
     today = date.today()
     default_y, default_m = today.year, today.month
@@ -1634,7 +1779,7 @@ if nav == "① 출고 캘린더":
 
     # 캘린더 월 변경 시 query 동기화
     if (int(cal_y) != int(y0)) or (int(cal_m) != int(m0)):
-        _qp_set(view="cal", mode=None, y=int(cal_y), m=int(cal_m), d=None, bp=None)
+        _qp_set(view="cal", mode=None, y=int(cal_y), m=int(cal_m), d=None, bp=None, sec=None, doc=None)
         st.rerun()
 
     # ✅ 캘린더 데이터 범위:
@@ -1647,12 +1792,13 @@ if nav == "① 출고 캘린더":
 
     st.divider()
 
-    if view == "cal" and (mode != "bp"):
+    # 모드별 화면
+    if view == "cal" and (mode not in ["bp", "doc"]):
         render_ship_calendar(cal_df.copy(), int(cal_y), int(cal_m))
     else:
-        # 상세 모드
+        # 상세 모드 공통: 캘린더로 돌아가기
         if st.button("⬅ 캘린더로 돌아가기"):
-            _qp_set(view="cal", mode=None, y=int(cal_y), m=int(cal_m), d=None, bp=None)
+            _qp_set(view="cal", mode=None, y=int(cal_y), m=int(cal_m), d=None, bp=None, sec=None, doc=None)
             st.rerun()
 
         if not qp_d or not qp_bp:
@@ -1660,7 +1806,23 @@ if nav == "① 출고 캘린더":
         else:
             ship_date_str = unquote(qp_d)
             bp = unquote(qp_bp)
-            render_bp_shipments_detail(cal_df.copy(), ship_date_str=ship_date_str, bp=bp)
+
+            if mode == "doc":
+                # ✅ 출고건ID 상세(드릴다운)
+                if st.button("⬅ BP 상세로 돌아가기"):
+                    _qp_set(view="cal", mode="bp", y=int(cal_y), m=int(cal_m), d=quote(ship_date_str), bp=quote(bp), sec=None, doc=None)
+                    st.rerun()
+
+                if not qp_sec or not qp_doc:
+                    st.info("출고건ID 상세를 보려면, BP 상세에서 출고건ID를 클릭하세요.")
+                else:
+                    section = unquote(qp_sec)
+                    ship_id = unquote(qp_doc)
+                    render_shipdoc_detail(cal_df.copy(), ship_date_str=ship_date_str, bp=bp, section=section, ship_id=ship_id)
+
+            else:
+                # ✅ BP 상세(출고건ID 목록)
+                render_bp_shipments_detail(cal_df.copy(), ship_date_str=ship_date_str, bp=bp, y=int(cal_y), m=int(cal_m))
 
 # =========================
 # ② SKU별 조회
