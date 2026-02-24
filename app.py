@@ -1,15 +1,6 @@
 # ==========================================
 # B2B 출고 대시보드 (Google Sheet 기반)
-# - 메뉴 순서: ① 출고캘린더 -> ② SKU별 조회 -> ③ 주차요약 -> ④ 월간요약 -> ⑤ 국가별 조회 -> ⑥ BP명별 조회
-# - 출고캘린더:
-#    * 월간 캘린더(월~일) 형태로 일자 표시
-#    * 일자별 BP명 “버튼”만 표시(해외/국내는 색상(이모지)으로만 구분)
-#      - 해외B2B: 🟣 BP명
-#      - 국내B2B: 🔵 BP명
-#    * BP 클릭 시 새창 없이 ‘출고 상세’ 화면으로 페이지 전환
-#    * 출고 상세: 출고일자/작업일자/요청수량 합 + 품목코드/품목명/요청수량 내역
-#    * “캘린더로 돌아가기” 버튼 제공(새창 없이 페이지 전환)
-#
+# - 메뉴 순서: ⓪ 출고캘린더 -> ① SKU별 조회 -> ② 주차요약 -> ③ 월간요약 -> ④ 국가별 조회 -> ⑤ BP명별 조회
 # - SKU별 조회 UI: 품목코드 검색(상단) -> 누적 SKU Top10(하단)
 # - SKU 자동 코멘트(룰 기반): MoM(2개월), 추이(3개월: 패턴 상세), BP 급증 사례(월단위)
 # - 코멘트 UI: 헤더-내용은 붙이고, 블록 간격만 확보(가독성 개선)
@@ -31,6 +22,12 @@
 #    * 전월 대비 주요 SKU 증감(% + 수량 prev→cur)
 #    * (해외B2B만) JP/CN 라인 제외 전월 대비 증가 SKU(%로 표기 + BP분해)
 #    * 차월 예정(선택월 다음달) 대량 출고 Top3 (BP명/품목코드/품목명/요청수량) — 특이건 없으면 생략
+#
+# - ✅ 출고캘린더(월간):
+#    * 월간 캘린더(월~일) 형태로 일자 표시
+#    * 일자별 BP명 버튼 표시(해외B2B=🟣 / 국내B2B=🔵 색상 아이콘으로 구분)
+#    * BP 클릭 시 "출고 상세"로 페이지 전환(새창 X), 뒤로가기 버튼 제공
+#    * 출고 상세: 출고일자/작업일자/요청수량 합 + 품목코드/품목명/요청수량 내역
 # ==========================================
 
 import re
@@ -70,12 +67,6 @@ CATEGORY_COL_CANDIDATES = [
 KEEP_CLASSES = ["B0", "B1"]
 LT_ONLY_CUST1 = "해외B2B"
 SPIKE_FACTOR = 1.3  # +30%
-
-# 캘린더: 해외/국내 표기(색상은 이모지로만)
-CUST1_OVER = "해외B2B"
-CUST1_DOM = "국내B2B"
-DOT_OVER = "🟣"
-DOT_DOM = "🔵"
 
 # =========================
 # Google Sheet 설정
@@ -181,59 +172,68 @@ hr {margin: 1.2rem 0;}
   line-height: 1.55;
 }
 
-/* ✅ 캘린더 UI (카카오 캘린더 느낌: 깔끔한 그리드) */
-.cal-wrap{
+/* ✅ 캘린더 */
+.cal-head {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin: 0.15rem 0 0.75rem 0;
+}
+.cal-title{
+  font-size: 1.05rem;
+  font-weight: 900;
+}
+.cal-legend{
+  color:#6b7280;
+  font-size:0.9rem;
+}
+.cal-weekday{
   border: 1px solid #e5e7eb;
-  border-radius: 16px;
-  overflow: hidden;
-  background: #fff;
-}
-.cal-head{
-  display:grid;
-  grid-template-columns: repeat(7, 1fr);
+  border-bottom: 0;
   background:#f9fafb;
-  border-bottom:1px solid #e5e7eb;
-}
-.cal-head div{
-  padding: 10px 10px;
-  font-weight: 800;
-  color:#111827;
+  padding: 10px 8px;
+  font-weight: 900;
   text-align:left;
-  font-size:0.92rem;
-}
-.cal-grid{
-  display:grid;
-  grid-template-columns: repeat(7, 1fr);
 }
 .cal-cell{
-  min-height: 120px;
-  border-right:1px solid #f3f4f6;
-  border-bottom:1px solid #f3f4f6;
+  border: 1px solid #e5e7eb;
   padding: 8px 8px 10px 8px;
+  min-height: 140px;
+  background:#fff;
 }
-.cal-cell:nth-child(7n){
-  border-right: none;
+.cal-cell.out{
+  background:#fcfcfd;
+  color:#9ca3af;
 }
 .cal-day{
-  display:flex;
-  justify-content: space-between;
-  align-items: center;
+  font-weight:900;
+  color:#111827;
   margin-bottom: 6px;
 }
-.cal-day .num{
-  font-weight: 900;
-  color:#111827;
+.cal-day.today{
+  display:inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background:#111827;
+  color:#fff;
 }
-.cal-day .muted{
-  color:#9ca3af;
-  font-weight: 700;
+.cal-btn-wrap .stButton>button{
+  width:100%;
+  padding: 5px 8px !important;
+  border-radius: 10px !important;
+  font-size: 0.82rem !important;
+  line-height: 1.2rem !important;
+  margin: 3px 0 !important;
 }
-.cal-bp{
-  display:flex;
-  flex-direction: column;
-  gap: 6px;
+.cal-btn-wrap .stButton>button:hover{
+  border-color:#94a3b8 !important;
 }
-.cal-note{color:#6b7280; font-size:0.9rem; margin: 6px 0 12px 0;}
+.cal-hint{
+  color:#6b7280;
+  font-size:0.9rem;
+  margin-top: -0.35rem;
+  margin-bottom: 0.6rem;
+}
 </style>
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
@@ -794,6 +794,7 @@ def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
 
 def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
     """
+    ✅ 요청 반영:
     - 4) Top BP 집중도: 1위 BP명(수량) 점유율
     - 5) Top SKU 집중도: 1위 품목코드 / 품목명(수량) 점유율
     """
@@ -856,6 +857,10 @@ def undated_ship_risk_comment(cur_df: pd.DataFrame) -> list[str]:
     return [f"출고일 미정 수량: {_fmt_int(miss_qty)} ({pct:.0f}%)"]
 
 def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> list[str]:
+    """
+    ✅ 요청 반영(현재값 + 증감):
+    예) 발주건수 35건 (-17 ▼) / 출고건수 18건 (+3 ▲) / 출고수량 10,000개 (-500 ▼) / 평균 리드타임 6.2일 (-2 ▼)
+    """
     cur_order = _get_order_cnt(cur_df)
     prev_order = _get_order_cnt(prev_df)
 
@@ -1233,11 +1238,109 @@ def load_raw_from_gsheet() -> pd.DataFrame:
 
     df["_week_key_num"] = df["_week_label"].apply(lambda x: week_key_num_from_label(x) if pd.notna(x) else None)
     df["_month_key_num"] = df["_month_label"].apply(lambda x: month_key_num_from_label(x) if pd.notna(x) else None)
+
+    # 캘린더용 date key
+    if COL_SHIP in df.columns:
+        df["_ship_date"] = pd.to_datetime(df[COL_SHIP], errors="coerce").dt.date
+    else:
+        df["_ship_date"] = pd.NaT
+
     return df
 
-# =========================
+# -------------------------
+# 캘린더 helpers
+# -------------------------
+def _init_calendar_state(df: pd.DataFrame):
+    if "cal_year" in st.session_state and "cal_month" in st.session_state:
+        return
+    # 기본: 데이터에서 가장 최근 출고일자 기준(없으면 오늘)
+    base_dt = None
+    if df is not None and (COL_SHIP in df.columns) and (not df[COL_SHIP].dropna().empty):
+        base_dt = pd.to_datetime(df[COL_SHIP], errors="coerce").max()
+    if pd.isna(base_dt) or base_dt is None:
+        base_dt = pd.Timestamp(date.today())
+    st.session_state["cal_year"] = int(base_dt.year)
+    st.session_state["cal_month"] = int(base_dt.month)
+
+def _shift_month(y: int, m: int, delta: int) -> tuple[int, int]:
+    # delta = -1 (prev), +1 (next)
+    mm = m + delta
+    yy = y
+    if mm <= 0:
+        yy -= 1
+        mm = 12
+    elif mm >= 13:
+        yy += 1
+        mm = 1
+    return yy, mm
+
+def _calendar_event_map(df: pd.DataFrame) -> dict[date, list[dict]]:
+    """
+    return:
+      { ship_date: [ {"bp":..., "cust1":..., "qty":...}, ... ] }
+    """
+    if df is None or df.empty:
+        return {}
+    if not need_cols(df, [COL_SHIP, COL_BP, COL_CUST1], "출고캘린더"):
+        return {}
+    tmp = df.copy()
+    tmp["_ship_date"] = pd.to_datetime(tmp[COL_SHIP], errors="coerce").dt.date
+    tmp = tmp[tmp["_ship_date"].notna()].copy()
+    if tmp.empty:
+        return {}
+    if COL_QTY in tmp.columns:
+        g = (
+            tmp.groupby(["_ship_date", COL_CUST1, COL_BP], dropna=False)[COL_QTY]
+            .sum(min_count=1)
+            .reset_index()
+            .rename(columns={COL_QTY: "qty"})
+        )
+    else:
+        g = (
+            tmp.groupby(["_ship_date", COL_CUST1, COL_BP], dropna=False)
+            .size()
+            .reset_index(name="qty")
+        )
+
+    g[COL_BP] = g[COL_BP].astype(str).str.strip()
+    g[COL_CUST1] = g[COL_CUST1].astype(str).str.strip()
+
+    out: dict[date, list[dict]] = {}
+    for _, r in g.iterrows():
+        d = r["_ship_date"]
+        if not isinstance(d, date):
+            continue
+        out.setdefault(d, []).append(
+            {"bp": str(r[COL_BP]).strip(), "cust1": str(r[COL_CUST1]).strip(), "qty": float(r["qty"]) if pd.notna(r["qty"]) else 0.0}
+        )
+
+    # 각 날짜 내부 정렬: qty desc
+    for k in list(out.keys()):
+        out[k] = sorted(out[k], key=lambda x: (-(x.get("qty", 0) or 0), x.get("bp", "")))
+    return out
+
+def _cust_icon(cust1: str) -> str:
+    # 색상은 아이콘으로만(요청사항)
+    if str(cust1).strip() == "해외B2B":
+        return "🟣"
+    if str(cust1).strip() == "국내B2B":
+        return "🔵"
+    return "⚪️"
+
+def _goto_ship_detail(ship_date: date, bp: str, cust1: str):
+    st.session_state["cal_view_mode"] = "detail"
+    st.session_state["cal_sel_date"] = ship_date.isoformat()
+    st.session_state["cal_sel_bp"] = bp
+    st.session_state["cal_sel_cust1"] = cust1
+    st.rerun()
+
+def _goto_calendar():
+    st.session_state["cal_view_mode"] = "calendar"
+    st.rerun()
+
+# -------------------------
 # Main
-# =========================
+# -------------------------
 st.title("📦 B2B 출고 대시보드")
 st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
 
@@ -1248,13 +1351,12 @@ if st.button("🔄 데이터 새로고침"):
         "sku_query", "sku_candidate_pick", "sku_show_all_history",
         "f_cust1", "f_cust2", "f_month", "f_bp",
         "sku_ignore_month_filter",
-        # 캘린더 상태
-        "cal_view", "cal_year", "cal_month", "cal_sel_date", "cal_sel_bp"
+        "cal_year", "cal_month", "cal_view_mode", "cal_sel_date", "cal_sel_bp", "cal_sel_cust1"
     ]
     for k in reset_keys:
         if k in st.session_state:
             del st.session_state[k]
-    st.session_state["nav_menu"] = "① 출고캘린더"
+    st.session_state["nav_menu"] = "⓪ 출고캘린더"
     st.rerun()
 
 try:
@@ -1289,6 +1391,7 @@ pool2 = pool1.copy()
 if sel_cust2 != "전체" and COL_CUST2 in pool2.columns:
     pool2 = pool2[pool2[COL_CUST2].astype(str).str.strip() == sel_cust2]
 
+# (기존 월 필터는 유지: 다른 탭 영향)
 month_labels = []
 if "_month_label" in pool2.columns:
     month_labels = [x for x in pool2["_month_label"].dropna().astype(str).unique().tolist() if x.strip() != ""]
@@ -1380,305 +1483,192 @@ st.divider()
 # =========================
 nav = st.radio(
     "메뉴",
-    ["① 출고캘린더", "② SKU별 조회", "③ 주차요약", "④ 월간요약", "⑤ 국가별 조회", "⑥ BP명별 조회"],
+    ["⓪ 출고캘린더", "① SKU별 조회", "② 주차요약", "③ 월간요약", "④ 국가별 조회", "⑤ BP명별 조회"],
     horizontal=True,
     key="nav_menu"
 )
 
 # =========================
-# ① 출고캘린더
+# ⓪ 출고캘린더
 # =========================
-def _init_calendar_state(dfall: pd.DataFrame):
-    if "cal_view" not in st.session_state:
-        st.session_state["cal_view"] = "calendar"  # calendar | detail
-
-    # 기본 월: (사이드바 월이 전체가 아니면 그 월), 아니면 출고일자 최대월(없으면 오늘)
-    if "cal_year" not in st.session_state or "cal_month" not in st.session_state:
-        y0 = m0 = None
-        if sel_month_label != "전체":
-            y0, m0 = parse_month_label_key(sel_month_label)
-        if (y0 is None) or (y0 <= 0) or (m0 is None) or (m0 <= 0):
-            if COL_SHIP in dfall.columns:
-                mx = pd.to_datetime(dfall[COL_SHIP], errors="coerce").max()
-            else:
-                mx = pd.NaT
-            if pd.notna(mx):
-                y0, m0 = int(mx.year), int(mx.month)
-            else:
-                today = date.today()
-                y0, m0 = today.year, today.month
-        st.session_state["cal_year"] = int(y0)
-        st.session_state["cal_month"] = int(m0)
-
-def _add_month(y: int, m: int, delta: int) -> tuple[int, int]:
-    nm = m + delta
-    ny = y
-    while nm <= 0:
-        nm += 12
-        ny -= 1
-    while nm > 12:
-        nm -= 12
-        ny += 1
-    return ny, nm
-
-def _calendar_events(df_scope: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
-    """
-    캘린더 표시용 이벤트:
-    - 출고일자 기준(출고일자 없는 건 캘린더에 표시하지 않음)
-    - 일자별 BP를 모아서 버튼 생성
-    - BP 색상은 거래처구분1(해외/국내) 기준으로 🟣/🔵 prefix
-    """
-    if df_scope is None or df_scope.empty:
-        return pd.DataFrame(columns=["ship_date", COL_BP, COL_CUST1])
-
-    if not all(c in df_scope.columns for c in [COL_SHIP, COL_BP]):
-        return pd.DataFrame(columns=["ship_date", COL_BP, COL_CUST1])
-
-    tmp = df_scope.copy()
-    ship_dt = pd.to_datetime(tmp[COL_SHIP], errors="coerce")
-    tmp = tmp[ship_dt.notna()].copy()
-    if tmp.empty:
-        return pd.DataFrame(columns=["ship_date", COL_BP, COL_CUST1])
-
-    tmp["ship_date"] = pd.to_datetime(tmp[COL_SHIP], errors="coerce").dt.date
-    tmp = tmp[(pd.to_datetime(tmp["ship_date"]) >= pd.Timestamp(date(year, month, 1))) &
-              (pd.to_datetime(tmp["ship_date"]) < pd.Timestamp(date(*_add_month(year, month, 1), 1)))].copy()
-    if tmp.empty:
-        return pd.DataFrame(columns=["ship_date", COL_BP, COL_CUST1])
-
-    # BP별 cust1(해외/국내) 결정: 해당 일자+BP에 해외가 하나라도 있으면 해외로
-    def pick_cust1(sub: pd.DataFrame) -> str:
-        if COL_CUST1 not in sub.columns:
-            return ""
-        vals = set(sub[COL_CUST1].dropna().astype(str).str.strip().tolist())
-        if CUST1_OVER in vals:
-            return CUST1_OVER
-        if CUST1_DOM in vals:
-            return CUST1_DOM
-        return (next(iter(vals)) if vals else "")
-
-    events = (
-        tmp.groupby(["ship_date", COL_BP], dropna=False)
-        .apply(pick_cust1)
-        .reset_index(name=COL_CUST1)
-    )
-
-    # 정렬: 날짜 -> 해외 먼저 -> BP명
-    def cust_rank(x: str) -> int:
-        x = (x or "").strip()
-        if x == CUST1_OVER:
-            return 0
-        if x == CUST1_DOM:
-            return 1
-        return 2
-
-    events["_r"] = events[COL_CUST1].astype(str).apply(cust_rank)
-    events[COL_BP] = events[COL_BP].astype(str).str.strip()
-    events = events.sort_values(["ship_date", "_r", COL_BP]).drop(columns=["_r"])
-    return events
-
-def _render_calendar_grid(year: int, month: int, events: pd.DataFrame):
-    cal = calendar.Calendar(firstweekday=0)  # 월요일 시작
-    weeks = cal.monthdayscalendar(year, month)  # 0이면 공백
-
-    # header
-    st.markdown(
-        """
-        <div class="cal-wrap">
-          <div class="cal-head">
-            <div>월</div><div>화</div><div>수</div><div>목</div><div>금</div><div>토</div><div>일</div>
-          </div>
-          <div class="cal-grid">
-        """,
-        unsafe_allow_html=True
-    )
-
-    ev_map = {}
-    if events is not None and not events.empty:
-        for (d, bp, cust1) in events[[ "ship_date", COL_BP, COL_CUST1]].itertuples(index=False, name=None):
-            ev_map.setdefault(d, []).append((bp, cust1))
-
-    # cells
-    for wk in weeks:
-        for daynum in wk:
-            if daynum == 0:
-                st.markdown(
-                    """
-                    <div class="cal-cell">
-                      <div class="cal-day"><div class="num muted"> </div><div class="muted"> </div></div>
-                      <div class="cal-bp"></div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                continue
-
-            d = date(year, month, int(daynum))
-            st.markdown(
-                f"""
-                <div class="cal-cell">
-                  <div class="cal-day">
-                    <div class="num">{daynum}</div>
-                    <div class="muted"></div>
-                  </div>
-                  <div class="cal-bp">
-                """,
-                unsafe_allow_html=True
-            )
-
-            items = ev_map.get(d, [])
-            if items:
-                # 너무 많으면 6개만 표시 + 더보기
-                show = items[:6]
-                rest = items[6:]
-                for idx, (bp, cust1) in enumerate(show):
-                    dot = DOT_OVER if str(cust1).strip() == CUST1_OVER else DOT_DOM
-                    label = f"{dot} {bp}"
-                    # key는 날짜+bp로 고정
-                    if st.button(label, key=f"cal_bp_{year}{month:02d}{daynum:02d}_{idx}_{bp}", use_container_width=True):
-                        st.session_state["cal_sel_date"] = d.isoformat()
-                        st.session_state["cal_sel_bp"] = bp
-                        st.session_state["cal_view"] = "detail"
-                        st.rerun()
-                if rest:
-                    st.caption(f"+{len(rest)}건 더 있음")
-            else:
-                st.caption("")
-
-            st.markdown("</div></div>", unsafe_allow_html=True)
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
-
-def _render_calendar_detail(df_scope: pd.DataFrame):
-    sel_date = st.session_state.get("cal_sel_date")
-    sel_bp2 = st.session_state.get("cal_sel_bp")
-
-    if not sel_date or not sel_bp2:
-        st.session_state["cal_view"] = "calendar"
-        st.rerun()
-
-    try:
-        d0 = pd.to_datetime(sel_date).date()
-    except Exception:
-        st.session_state["cal_view"] = "calendar"
-        st.rerun()
-
-    st.subheader("출고 상세")
-    c1, c2 = st.columns([1, 4])
-    with c1:
-        if st.button("⬅️ 캘린더로 돌아가기", use_container_width=True):
-            st.session_state["cal_view"] = "calendar"
-            st.rerun()
-    with c2:
-        st.markdown(f"**출고일자:** `{d0}`  |  **BP명:** `{sel_bp2}`")
-
-    if df_scope is None or df_scope.empty:
-        st.info("표시할 데이터가 없습니다.")
-        return
-
-    if not need_cols(df_scope, [COL_SHIP, COL_DONE, COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY], "출고 상세"):
-        return
-
-    tmp = df_scope.copy()
-    tmp["_ship_date"] = pd.to_datetime(tmp[COL_SHIP], errors="coerce").dt.date
-    tmp = tmp[(tmp["_ship_date"] == d0) & (tmp[COL_BP].astype(str).str.strip() == str(sel_bp2).strip())].copy()
-
-    if tmp.empty:
-        st.warning("선택한 날짜/ BP에 해당하는 출고 데이터가 없습니다. (필터 영향 가능)")
-        return
-
-    # 상단 요약
-    total_qty2 = int(round(tmp[COL_QTY].fillna(0).sum(), 0))
-    done_min = pd.to_datetime(tmp[COL_DONE], errors="coerce").min()
-    done_max = pd.to_datetime(tmp[COL_DONE], errors="coerce").max()
-    cust1 = "-"
-    if COL_CUST1 in tmp.columns:
-        vals = tmp[COL_CUST1].dropna().astype(str).str.strip().unique().tolist()
-        if vals:
-            cust1 = ", ".join(vals[:2]) + ("..." if len(vals) > 2 else "")
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("요청수량 합", f"{total_qty2:,}")
-    k2.metric("거래처구분1", cust1)
-    k3.metric("작업일자(최소)", fmt_date(done_min))
-    k4.metric("작업일자(최대)", fmt_date(done_max))
-
-    st.divider()
-
-    # 품목 내역
-    item = (
-        tmp.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
-        .sum(min_count=1)
-        .reset_index()
-        .rename(columns={COL_QTY: "요청수량"})
-        .sort_values("요청수량", ascending=False, na_position="last")
-        .copy()
-    )
-    item["요청수량"] = item["요청수량"].fillna(0).round(0).astype(int)
-
-    render_pretty_table(
-        item[[COL_ITEM_CODE, COL_ITEM_NAME, "요청수량"]],
-        height=520,
-        wrap_cols=[COL_ITEM_NAME],
-        col_width_px={COL_ITEM_CODE: 140, COL_ITEM_NAME: 560, "요청수량": 120},
-        number_cols=["요청수량"],
-    )
-
-if nav == "① 출고캘린더":
+if nav == "⓪ 출고캘린더":
     st.subheader("출고캘린더")
-    st.markdown('<div class="cal-note">※ 각 날짜의 BP명을 클릭하면 “출고 상세”로 이동합니다. (새창 없이 페이지 전환)</div>', unsafe_allow_html=True)
-    st.caption("표기: 🟣 해외B2B / 🔵 국내B2B (텍스트 라벨 없이 색상(이모지)으로만 구분)")
 
-    # 캘린더는 ‘월 필터’를 무시하고(월 이동을 위해), 나머지 필터(거래처구분1/2, BP)는 반영
-    cal_scope = pool2.copy()  # cust1/2 반영, month 미반영
-    if sel_bp != "전체" and COL_BP in cal_scope.columns:
-        cal_scope = cal_scope[cal_scope[COL_BP].astype(str).str.strip() == sel_bp].copy()
+    # 캘린더는 "월 필터"와 별개로 동작(요청: 월별 캘린더 자체가 월 네비)
+    # 하지만 거래처구분1/2 + BP 필터는 반영
+    base_cal = pool2.copy()
+    if sel_bp != "전체" and COL_BP in base_cal.columns:
+        base_cal = base_cal[base_cal[COL_BP].astype(str).str.strip() == sel_bp]
 
-    _init_calendar_state(cal_scope)
+    _init_calendar_state(base_cal)
+    st.session_state.setdefault("cal_view_mode", "calendar")
 
+    # 월 이동 UI
     y = int(st.session_state["cal_year"])
     m = int(st.session_state["cal_month"])
 
-    # 상단 네비게이션
-    left, mid, right = st.columns([1, 3, 1])
-    with left:
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("◀", use_container_width=True, key="cal_prev"):
-                y, m = _add_month(y, m, -1)
-                st.session_state["cal_year"], st.session_state["cal_month"] = y, m
-                st.session_state["cal_view"] = "calendar"
-                st.rerun()
-        with b2:
-            if st.button("오늘", use_container_width=True, key="cal_today"):
-                t = date.today()
-                st.session_state["cal_year"], st.session_state["cal_month"] = t.year, t.month
-                st.session_state["cal_view"] = "calendar"
-                st.rerun()
-    with mid:
-        st.markdown(f"<h3 style='text-align:center; margin: 0.25rem 0 0 0;'>{y}년 {m}월</h3>", unsafe_allow_html=True)
-    with right:
-        if st.button("▶", use_container_width=True, key="cal_next"):
-            y, m = _add_month(y, m, +1)
+    colA, colB, colC, colD = st.columns([1.2, 4.5, 1.6, 1.2])
+    with colA:
+        if st.button("◀", key="cal_prev"):
+            y, m = _shift_month(y, m, -1)
             st.session_state["cal_year"], st.session_state["cal_month"] = y, m
-            st.session_state["cal_view"] = "calendar"
+            st.session_state["cal_view_mode"] = "calendar"
+            st.rerun()
+        if st.button("오늘", key="cal_today"):
+            td = date.today()
+            st.session_state["cal_year"], st.session_state["cal_month"] = td.year, td.month
+            st.session_state["cal_view_mode"] = "calendar"
+            st.rerun()
+    with colB:
+        st.markdown(f"<div class='cal-title'>{y}년 {m}월</div>", unsafe_allow_html=True)
+        st.markdown("<div class='cal-hint'>※ 각 날짜의 BP명을 클릭하면 ‘출고 상세’로 이동합니다. (새창 없이 페이지 전환)</div>", unsafe_allow_html=True)
+    with colC:
+        st.markdown("<div class='cal-legend'>🟣 해외B2B&nbsp;&nbsp;&nbsp;🔵 국내B2B</div>", unsafe_allow_html=True)
+    with colD:
+        if st.button("▶", key="cal_next"):
+            y, m = _shift_month(y, m, +1)
+            st.session_state["cal_year"], st.session_state["cal_month"] = y, m
+            st.session_state["cal_view_mode"] = "calendar"
             st.rerun()
 
-    st.divider()
+    # 상세 보기
+    if st.session_state.get("cal_view_mode") == "detail":
+        sel_date_s = st.session_state.get("cal_sel_date", "")
+        sel_bp_name = st.session_state.get("cal_sel_bp", "")
+        sel_cust1_name = st.session_state.get("cal_sel_cust1", "")
 
-    # 뷰 전환(캘린더/상세)
-    if st.session_state.get("cal_view") == "detail":
-        _render_calendar_detail(cal_scope)
-    else:
-        events = _calendar_events(cal_scope, y, m)
-        if events.empty:
-            st.info("선택한 월에 출고일자 데이터가 없습니다. (출고일자 미정 건은 캘린더에 표시하지 않습니다.)")
-        _render_calendar_grid(y, m, events)
+        try:
+            sel_d = datetime.strptime(sel_date_s, "%Y-%m-%d").date()
+        except Exception:
+            sel_d = None
+
+        st.markdown("### 출고 상세")
+        if st.button("← 캘린더로 돌아가기", key="cal_back"):
+            _goto_calendar()
+
+        if sel_d is None:
+            st.warning("선택된 날짜 정보를 확인할 수 없습니다.")
+            st.stop()
+
+        # 상세 데이터: 선택일자 + BP + 거래처구분1
+        det = base_cal.copy()
+        if not need_cols(det, [COL_SHIP, COL_BP, COL_CUST1, COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY], "출고 상세"):
+            st.stop()
+
+        det["_ship_date"] = pd.to_datetime(det[COL_SHIP], errors="coerce").dt.date
+        det = det[
+            (det["_ship_date"] == sel_d) &
+            (det[COL_BP].astype(str).str.strip() == str(sel_bp_name).strip()) &
+            (det[COL_CUST1].astype(str).str.strip() == str(sel_cust1_name).strip())
+        ].copy()
+
+        if det.empty:
+            st.info("해당 조건의 출고 상세 내역이 없습니다.")
+            st.stop()
+
+        # 상단 요약
+        ship_dt = pd.to_datetime(det[COL_SHIP], errors="coerce").dropna()
+        done_dt = pd.to_datetime(det[COL_DONE], errors="coerce").dropna() if COL_DONE in det.columns else pd.Series([], dtype="datetime64[ns]")
+        ship_disp = ship_dt.min() if not ship_dt.empty else pd.NaT
+        done_disp = done_dt.min() if not done_dt.empty else pd.NaT
+        qty_sum = int(round(det[COL_QTY].fillna(0).sum(), 0))
+
+        st.markdown(
+            f"- **출고일자:** {fmt_date(ship_disp)}\n"
+            f"- **작업일자:** {fmt_date(done_disp)}\n"
+            f"- **BP명:** {_escape(sel_bp_name)} ({_cust_icon(sel_cust1_name)} {_escape(sel_cust1_name)})\n"
+            f"- **요청수량 합:** {qty_sum:,}"
+        )
+
+        st.divider()
+        st.markdown("### 상세 출고 품목 내역")
+
+        item = (
+            det.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+            .sum(min_count=1)
+            .reset_index()
+            .rename(columns={COL_QTY: "요청수량"})
+            .sort_values("요청수량", ascending=False, na_position="last")
+        )
+        item["요청수량"] = item["요청수량"].fillna(0).round(0).astype(int)
+
+        render_pretty_table(
+            item[[COL_ITEM_CODE, COL_ITEM_NAME, "요청수량"]],
+            height=520,
+            wrap_cols=[COL_ITEM_NAME],
+            col_width_px={COL_ITEM_CODE: 150, COL_ITEM_NAME: 520, "요청수량": 140},
+            number_cols=["요청수량"],
+        )
+
+        st.stop()
+
+    # 캘린더 뷰
+    # 이번 달 데이터만 추려서 event_map 만들기(출고일자 기준)
+    tmp = base_cal.copy()
+    if not need_cols(tmp, [COL_SHIP, COL_BP, COL_CUST1], "출고캘린더"):
+        st.stop()
+
+    tmp["_ship_date"] = pd.to_datetime(tmp[COL_SHIP], errors="coerce").dt.date
+    tmp = tmp[tmp["_ship_date"].notna()].copy()
+    # 현재 달만
+    tmp = tmp[(pd.to_datetime(tmp["_ship_date"]) >= pd.Timestamp(date(y, m, 1)))].copy()
+    last_day = calendar.monthrange(y, m)[1]
+    tmp = tmp[(pd.to_datetime(tmp["_ship_date"]) <= pd.Timestamp(date(y, m, last_day)))].copy()
+
+    event_map = _calendar_event_map(tmp)
+
+    # 요일 헤더(월~일)
+    weekday_labels = ["월", "화", "수", "목", "금", "토", "일"]
+    header_cols = st.columns(7)
+    for i, lab in enumerate(weekday_labels):
+        with header_cols[i]:
+            st.markdown(f"<div class='cal-weekday'>{lab}</div>", unsafe_allow_html=True)
+
+    cal = calendar.Calendar(firstweekday=0)  # Monday=0
+    weeks = cal.monthdatescalendar(y, m)
+
+    today_d = date.today()
+    for wi, week in enumerate(weeks):
+        cols = st.columns(7, gap="small")
+        for di, dday in enumerate(week):
+            in_month = (dday.month == m)
+            with cols[di]:
+                # cell top
+                cell_cls = "cal-cell" + ("" if in_month else " out")
+                st.markdown(f"<div class='{cell_cls}'>", unsafe_allow_html=True)
+
+                # day label
+                if dday == today_d and in_month:
+                    st.markdown(f"<div class='cal-day'><span class='cal-day today'>{dday.day}</span></div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<div class='cal-day'>{dday.day}</div>", unsafe_allow_html=True)
+
+                # events
+                evs = event_map.get(dday, [])
+                if in_month and evs:
+                    st.markdown("<div class='cal-btn-wrap'>", unsafe_allow_html=True)
+                    # 너무 많으면 상위 6개 + 더보기(텍스트)
+                    show_n = 6
+                    for ei, ev in enumerate(evs[:show_n]):
+                        bp = ev.get("bp", "")
+                        cust1 = ev.get("cust1", "")
+                        icon = _cust_icon(cust1)
+                        key = f"cal_evt_{dday.isoformat()}_{cust1}_{bp}_{ei}"
+                        if st.button(f"{icon} {bp}", key=key, use_container_width=True):
+                            _goto_ship_detail(dday, bp, cust1)
+                    if len(evs) > show_n:
+                        st.caption(f"+{len(evs)-show_n}건 더 있음")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    # 빈 공간 유지
+                    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# ② SKU별 조회
+# ① SKU별 조회
 # =========================
-elif nav == "② SKU별 조회":
+elif nav == "① SKU별 조회":
     st.subheader("SKU별 조회")
 
     ignore_month = st.checkbox("월 필터 무시(전체기간 기준으로 SKU 조회/코멘트)", value=True, key="sku_ignore_month_filter")
@@ -1821,9 +1811,9 @@ elif nav == "② SKU별 조회":
     st.caption("※ BP명(요청수량)은 해당 SKU의 출고처별 수량 합계입니다. (왼쪽 필터 범위 기준)")
 
 # =========================
-# ③ 주차요약
+# ② 주차요약
 # =========================
-elif nav == "③ 주차요약":
+elif nav == "② 주차요약":
     st.subheader("주차요약")
 
     d = df_view.copy()
@@ -1923,9 +1913,9 @@ elif nav == "③ 주차요약":
         )
 
 # =========================
-# ④ 월간요약
+# ③ 월간요약
 # =========================
-elif nav == "④ 월간요약":
+elif nav == "③ 월간요약":
     st.subheader("월간요약")
 
     d = df_view.copy()
@@ -2046,9 +2036,9 @@ elif nav == "④ 월간요약":
         )
 
 # =========================
-# ⑤ 국가별 조회
+# ④ 국가별 조회
 # =========================
-elif nav == "⑤ 국가별 조회":
+elif nav == "④ 국가별 조회":
     st.subheader("국가별 조회 (거래처구분2 기준)")
 
     if not need_cols(df_view, [COL_CUST2, COL_QTY, COL_LT2], "국가별 조회"):
@@ -2085,9 +2075,9 @@ elif nav == "⑤ 국가별 조회":
     st.caption("※ P90은 ‘느린 상위 10%’ 경계값(리드타임이 큰 구간)입니다.")
 
 # =========================
-# ⑥ BP명별 조회
+# ⑤ BP명별 조회
 # =========================
-elif nav == "⑥ BP명별 조회":
+elif nav == "⑤ BP명별 조회":
     st.subheader("BP명별 조회")
 
     if not need_cols(df_view, [COL_BP, COL_QTY, COL_LT2], "BP명별 조회"):
