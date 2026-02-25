@@ -5,7 +5,8 @@
 #    * ✅ Streamlit native 월 전체 캘린더(일~토 그리드) = st.columns(7) 기반 (그리드 깨짐 방지)
 #    * 출고일자 기준으로 일자 박스 내 BP명 표시
 #    * 출고건 많으면 +N건 클릭 시 펼침/접기
-#    * ✅ BP명 클릭 시 페이지 전환(새창 X) = session_state 라우팅으로 상세 화면 이동
+#    * ✅ BP명 클릭 시 페이지 전환(새창 X) = 링크(쿼리파라미터) 내비게이션으로 상세 화면 이동
+#    * ✅ 해외B2B/국내B2B 구분 = 캘린더 BP 버튼 색상으로 구별
 #    * 상세 화면: 출고일자/작업완료/요청수량합/품목코드/품목명/요청수량
 #    * 상세에서 캘린더로 돌아가기
 #
@@ -36,7 +37,7 @@ import re
 import html
 import calendar as pycal
 from datetime import date, datetime
-from urllib.parse import quote  # (다른 곳에서 쓸 수 있어 유지)
+from urllib.parse import quote  # ✅ 링크 내비게이션에서 사용
 
 import streamlit as st
 import pandas as pd
@@ -201,6 +202,60 @@ hr {margin: 1.2rem 0;}
   margin: 0.08rem 0 0 0;
   line-height: 1.55;
 }
+
+/* ✅ 캘린더 링크(버튼처럼 보이게) */
+.cal-nav-wrap{display:flex; gap:0.5rem; justify-content:space-between; align-items:center;}
+a.cal-nav{
+  display:inline-block;
+  width:100%;
+  text-align:center;
+  padding:0.55rem 0.6rem;
+  border:1px solid #e5e7eb;
+  border-radius:12px;
+  background:#ffffff;
+  color:#111827;
+  text-decoration:none;
+  font-weight:700;
+}
+a.cal-nav:hover{background:#f9fafb;}
+
+a.cal-link{
+  display:block;
+  width:100%;
+  padding:0.42rem 0.55rem;
+  border:1px solid #e5e7eb;
+  border-radius:10px;
+  background:#ffffff;
+  color:#111827;
+  text-decoration:none;
+  font-size:0.86rem;
+  line-height:1.2rem;
+  margin:0.28rem 0;
+  box-sizing:border-box;
+}
+a.cal-link:hover{background:#f3f4f6;}
+a.cal-link.overseas{
+  background:#eef2ff;
+  border-color:#c7d2fe;
+}
+a.cal-link.domestic{
+  background:#ecfeff;
+  border-color:#a5f3fc;
+}
+a.cal-action{
+  display:block;
+  width:100%;
+  padding:0.42rem 0.55rem;
+  border:1px dashed #e5e7eb;
+  border-radius:10px;
+  background:#ffffff;
+  color:#374151;
+  text-decoration:none;
+  font-size:0.86rem;
+  margin:0.28rem 0;
+  text-align:center;
+}
+a.cal-action:hover{background:#f9fafb;}
 </style>
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
@@ -1213,7 +1268,7 @@ def load_raw_from_gsheet() -> pd.DataFrame:
     return df
 
 # =========================
-# 캘린더 state & routing (✅ query param 제거, session_state로 페이지 전환)
+# 캘린더 state & routing
 # =========================
 def init_calendar_state():
     if "cal_view" not in st.session_state:
@@ -1263,6 +1318,64 @@ def go_detail(ship_date: date, bp: str):
     st.session_state["cal_selected_bp"] = bp
     safe_rerun()
 
+# ✅ 링크 내비게이션(쿼리파라미터) → session_state에 반영
+def sync_calendar_from_qp():
+    qp = get_qp()
+    action = qp_get_one(qp, "cal", "").strip().lower()
+    if not action:
+        return
+
+    # 공통 파라미터
+    ym = qp_get_one(qp, "ym", "").strip()
+    d_str = qp_get_one(qp, "d", "").strip()
+    bp = qp_get_one(qp, "bp", "")
+
+    try:
+        if action == "setym":
+            if ym:
+                st.session_state["cal_ym"] = ym
+            st.session_state["cal_view"] = "calendar"
+
+        elif action == "detail":
+            if ym:
+                st.session_state["cal_ym"] = ym
+            if d_str:
+                st.session_state["cal_selected_date"] = date.fromisoformat(d_str)
+            st.session_state["cal_selected_bp"] = bp
+            st.session_state["cal_view"] = "detail"
+
+        elif action == "toggle":
+            # 펼침/접기 토글
+            if d_str:
+                dd = date.fromisoformat(d_str)
+                expanded: set[date] = st.session_state.get("cal_expanded", set())
+                if dd in expanded:
+                    expanded.discard(dd)
+                else:
+                    expanded.add(dd)
+                st.session_state["cal_expanded"] = expanded
+            st.session_state["cal_view"] = "calendar"
+            if ym:
+                st.session_state["cal_ym"] = ym
+
+        elif action == "back":
+            st.session_state["cal_view"] = "calendar"
+            if ym:
+                st.session_state["cal_ym"] = ym
+
+    finally:
+        # ✅ 액션이 계속 반복 적용되는 것 방지
+        set_qp()
+
+def cal_href(action: str, **params) -> str:
+    # query string 생성 (값은 quote 처리)
+    qs = [f"cal={quote(str(action))}"]
+    for k, v in params.items():
+        if v is None:
+            continue
+        qs.append(f"{quote(str(k))}={quote(str(v))}")
+    return "?" + "&".join(qs)
+
 # =========================
 # Main
 # =========================
@@ -1284,7 +1397,7 @@ if st.button("🔄 데이터 새로고침"):
     for k in reset_keys:
         if k in st.session_state:
             del st.session_state[k]
-    set_qp()  # (남겨둬도 무해)
+    set_qp()
     st.session_state["nav_menu"] = "① 출고 캘린더"
     safe_rerun()
 
@@ -1429,9 +1542,10 @@ def build_calendar_base_df() -> pd.DataFrame:
     safe_num(base, COL_QTY)
     return base
 
-def build_day_map(cal_base: pd.DataFrame, ym: str) -> dict[date, list[tuple[str, int]]]:
+def build_day_map(cal_base: pd.DataFrame, ym: str) -> dict[date, list[dict]]:
     """
-    day_map[date] = [(bp, qty_sum_int), ...] qty desc
+    ✅ 해외/국내 색상 구분을 위해 cust1(거래처구분1) 정보 포함
+    out[date] = [{"bp":..., "qty":..., "cust1":...}, ...]  qty desc
     """
     if cal_base is None or cal_base.empty:
         return {}
@@ -1446,40 +1560,76 @@ def build_day_map(cal_base: pd.DataFrame, ym: str) -> dict[date, list[tuple[str,
 
     tmp["_d"] = tmp["_ship_dt"].dt.date
 
+    if COL_CUST1 not in tmp.columns:
+        tmp[COL_CUST1] = ""
+
     g = (
-        tmp.groupby(["_d", COL_BP], dropna=False)[COL_QTY]
+        tmp.groupby(["_d", COL_BP, COL_CUST1], dropna=False)[COL_QTY]
         .sum(min_count=1)
         .reset_index()
         .rename(columns={COL_QTY: "qty_sum"})
     )
     g["qty_sum"] = pd.to_numeric(g["qty_sum"], errors="coerce").fillna(0).round(0).astype(int)
 
-    out: dict[date, list[tuple[str, int]]] = {}
+    # (d, bp) 기준: total qty + cust1은 qty가 가장 큰 cust1 선택
+    out: dict[date, list[dict]] = {}
     for d, sub in g.groupby("_d"):
-        sub = sub.sort_values("qty_sum", ascending=False)
-        out[d] = [(str(r[COL_BP]).strip(), int(r["qty_sum"])) for _, r in sub.iterrows()]
+        # bp별 total
+        total = (
+            sub.groupby(COL_BP, dropna=False)["qty_sum"]
+            .sum()
+            .reset_index()
+            .rename(columns={"qty_sum": "qty_total"})
+        )
+
+        # bp별 대표 cust1(최대 qty)
+        idx = sub.sort_values("qty_sum", ascending=False).groupby(COL_BP, dropna=False).head(1)
+        cust_pick = idx[[COL_BP, COL_CUST1]].copy()
+        cust_pick[COL_CUST1] = cust_pick[COL_CUST1].astype(str).str.strip()
+
+        merged = total.merge(cust_pick, on=COL_BP, how="left")
+        merged["qty_total"] = merged["qty_total"].fillna(0).astype(int)
+        merged[COL_CUST1] = merged[COL_CUST1].fillna("").astype(str)
+
+        merged = merged.sort_values("qty_total", ascending=False, na_position="last")
+        out[d] = [
+            {"bp": str(r[COL_BP]).strip(), "qty": int(r["qty_total"]), "cust1": str(r[COL_CUST1]).strip()}
+            for _, r in merged.iterrows()
+        ]
     return out
 
 def render_month_calendar_native(cal_base: pd.DataFrame, ym: str):
+    """
+    ✅ “링크 내비게이션 버전”
+    - 이전/다음달: 링크
+    - BP 클릭: 링크(페이지 전환, 새창X)
+    - +N 더보기/접기: 링크(토글)
+    - 해외/국내 구분: BP 링크 배경색으로 구별
+    """
     if not need_cols(cal_base, [COL_SHIP, COL_BP, COL_QTY], "출고 캘린더"):
         return
 
     y, m = ym_to_year_month(ym)
     day_map = build_day_map(cal_base, ym)
 
-    # 상단 툴바
+    prev_ym = add_months(ym, -1)
+    next_ym = add_months(ym, +1)
+
+    # 상단 툴바 (링크)
     t1, t2, t3 = st.columns([1.2, 2.2, 1.2], vertical_alignment="center")
     with t1:
-        if st.button("◀ 이전달", use_container_width=True, key=f"cal_prev_{ym}"):
-            st.session_state["cal_expanded"] = set()
-            go_calendar(add_months(ym, -1))
+        st.markdown(
+            f'<div class="cal-nav-wrap"><a class="cal-nav" href="{cal_href("setym", ym=prev_ym)}">◀ 이전달</a></div>',
+            unsafe_allow_html=True
+        )
     with t2:
         st.markdown(f"### {y}년 {m}월 출고 캘린더")
         st.caption("※ 일자 박스의 BP명을 클릭하면 출고 상세 화면으로 이동합니다. (페이지 전환)")
     with t3:
-        if st.button("다음달 ▶", use_container_width=True, key=f"cal_next_{ym}"):
-            st.session_state["cal_expanded"] = set()
-            go_calendar(add_months(ym, +1))
+        st.markdown(
+            f'<div class="cal-nav-wrap"><a class="cal-nav" href="{cal_href("setym", ym=next_ym)}">다음달 ▶</a></div>',
+            unsafe_allow_html=True
+        )
 
     # 요일 헤더
     weekdays = ["일", "월", "화", "수", "목", "금", "토"]
@@ -1512,31 +1662,50 @@ def render_month_calendar_native(cal_base: pd.DataFrame, ym: str):
                 with st.container(border=True):
                     st.markdown(f"**{day_num}**")
 
-                    # BP 버튼
+                    # BP 링크(색상 구분)
                     for idx in range(show_n):
-                        bp, qsum = events[idx]
-                        btn_label = f"{bp} ({qsum:,})"
-                        if st.button(btn_label, key=f"cal_bp_{ym}_{d.isoformat()}_{idx}", use_container_width=True):
-                            go_detail(d, bp)
+                        e = events[idx]
+                        bp = e.get("bp", "")
+                        qsum = int(e.get("qty", 0))
+                        cust1 = (e.get("cust1", "") or "").strip()
 
-                    # +N 더보기 / 접기
+                        cls = ""
+                        if cust1 == "해외B2B":
+                            cls = "overseas"
+                        elif cust1 == "국내B2B":
+                            cls = "domestic"
+
+                        label = f"{html.escape(str(bp))} ({qsum:,})"
+                        href = cal_href("detail", ym=ym, d=d.isoformat(), bp=bp)
+                        st.markdown(
+                            f'<a class="cal-link {cls}" href="{href}">{label}</a>',
+                            unsafe_allow_html=True
+                        )
+
+                    # +N 더보기 / 접기 (링크 토글)
                     if hidden > 0 and (not is_expanded):
-                        if st.button(f"+{hidden}건 더 보기", key=f"cal_more_{ym}_{d.isoformat()}", use_container_width=True):
-                            expanded.add(d)
-                            st.session_state["cal_expanded"] = expanded
-                            safe_rerun()
+                        href_more = cal_href("toggle", ym=ym, d=d.isoformat())
+                        st.markdown(
+                            f'<a class="cal-action" href="{href_more}">+{hidden}건 더 보기</a>',
+                            unsafe_allow_html=True
+                        )
 
                     if is_expanded and len(events) > 3:
-                        if st.button("접기", key=f"cal_less_{ym}_{d.isoformat()}", use_container_width=True):
-                            expanded.discard(d)
-                            st.session_state["cal_expanded"] = expanded
-                            safe_rerun()
+                        href_less = cal_href("toggle", ym=ym, d=d.isoformat())
+                        st.markdown(
+                            f'<a class="cal-action" href="{href_less}">접기</a>',
+                            unsafe_allow_html=True
+                        )
 
 # =========================
 # ① 출고 캘린더 / 상세 라우팅
 # =========================
 if nav == "① 출고 캘린더":
     init_calendar_state()
+
+    # ✅ 링크 내비게이션 액션 반영
+    sync_calendar_from_qp()
+
     cal_base = build_calendar_base_df()
 
     # 기본 ym: 출고일자 기준 최신 월
