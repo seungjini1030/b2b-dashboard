@@ -7,9 +7,12 @@
 # 3) 10만행 대비: df.apply(axis=1) 제거(주차 벡터화) + 캘린더용 집계(cal_agg) 캐시 생성
 # 4) 캘린더 표기: 태그(🟦 해외 / 🟩 국내)
 #
-# ✅ 이번 수정(요청사항)
-# - 출고건수 정의를 대표행(TRUE) 기반이 아닌,
-#   "주문번호(distinct)" 기준으로 전 화면( KPI/TopBP/코멘트/국가별/BP별 ) 통일
+# ✅ 반영(출고건수)
+# - 출고건수 = 주문번호(distinct) 기준 통일
+#
+# ✅ 이번 요청 반영(2가지)
+# - 메뉴 이동 시 ① 출고 캘린더는 항상 '캘린더 메인'으로 진입(상세 화면 상태 유지 방지)
+# - 상세 화면 작업완료가 단일 날짜면 'YYYY-MM-DD'로 단일 표시(동일일자 ~ 동일일자 제거)
 # ==========================================
 
 import re
@@ -404,15 +407,6 @@ def _fmt_int(x) -> str:
         return "0"
 
 
-def _fmt_date_or_mijung(x) -> str:
-    if pd.isna(x) or x is None or str(x).strip() == "":
-        return "미정"
-    try:
-        return pd.to_datetime(x).strftime("%Y-%m-%d")
-    except Exception:
-        return str(x)
-
-
 def sku_comment_mom(sku_month: pd.DataFrame) -> list[str]:
     if sku_month is None or sku_month.empty:
         return []
@@ -614,9 +608,6 @@ def _fmt_delta(diff: float) -> str:
 
 
 def _clean_nunique(series: pd.Series) -> int:
-    """
-    ✅ distinct 카운트 공통(주문번호)
-    """
     if series is None:
         return 0
     s = series.astype(str).str.strip()
@@ -632,8 +623,7 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
     """
-    ✅ 수정: 출고건수 = 주문번호(distinct) 통일
-    (이전: 대표행 TRUE 합계)
+    ✅ 출고건수 = 주문번호 distinct
     """
     if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
@@ -1049,19 +1039,16 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
             dtype=DTYPE_MAP,
         )
     except Exception:
-        # usecols/dtype가 안 맞으면 fallback
         df = pd.read_csv(csv_url, header=HEADER_ROW_0BASED)
 
     df.columns = df.columns.astype(str).str.strip()
     df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
 
-    # 타입 변환
     for c in [COL_SHIP, COL_DONE, COL_ORDER_DATE]:
         safe_dt(df, c)
     for c in [COL_QTY, COL_LT2, "리드타임1"]:
         safe_num(df, c)
 
-    # 리드타임 대체 계산(필요 시)
     if (COL_LT2 not in df.columns) or (df[COL_LT2].dropna().empty):
         if all(c in df.columns for c in [COL_DONE, COL_ORDER_DATE]):
             df[COL_LT2] = (df[COL_DONE] - df[COL_ORDER_DATE]).dt.days
@@ -1069,14 +1056,11 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     normalize_text_cols(df, [COL_BP, COL_ITEM_CODE, COL_ITEM_NAME, COL_CUST1, COL_CUST2, COL_CLASS, COL_MAIN, COL_ORDER_NO])
 
-    # 제품분류 고정
     if COL_CLASS in df.columns:
         df = df[df[COL_CLASS].astype(str).str.strip().isin(KEEP_CLASSES)].copy()
 
-    # 대표행(계속 유지: 다른 용도(원본 로직) 대비)
     df["_is_rep"] = to_bool_true(df[COL_MAIN]) if COL_MAIN in df.columns else False
 
-    # ✅ 주차 라벨/키 벡터화(출고일 우선, 없으면 작업완료일)
     ship_dt = pd.to_datetime(df[COL_SHIP], errors="coerce") if COL_SHIP in df.columns else pd.Series(pd.NaT, index=df.index)
     done_dt = pd.to_datetime(df[COL_DONE], errors="coerce") if COL_DONE in df.columns else pd.Series(pd.NaT, index=df.index)
     base_dt = ship_dt.fillna(done_dt)
@@ -1098,7 +1082,6 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
         wk
     ).astype("Int64")
 
-    # ✅ 월 라벨/키 벡터화(y*100+m)
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce").astype("Int64")
         m = pd.to_numeric(df[COL_MONTH], errors="coerce").astype("Int64")
@@ -1113,11 +1096,9 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
         df["_month_label"] = pd.NA
         df["_month_key_num"] = pd.NA
 
-    # 캘린더용 컬럼
     df["_ship_date"] = ship_dt.dt.date
     df["_ship_ym"] = ship_dt.dt.strftime("%Y-%m")
 
-    # ✅ 캘린더 집계(cal_agg) 생성
     cal_src = df.dropna(subset=["_ship_date"]).copy()
     if cal_src.empty:
         cal_agg = pd.DataFrame(columns=["_ship_ym", "_ship_date", COL_BP, COL_CUST1, COL_CUST2, "qty_sum"])
@@ -1139,7 +1120,7 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 def compute_kpis(df_view: pd.DataFrame):
     total_qty = float(df_view[COL_QTY].fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
 
-    # ✅ 수정: 출고건수 = 주문번호 distinct
+    # ✅ 출고건수 = 주문번호 distinct
     total_cnt = _clean_nunique(df_view[COL_ORDER_NO]) if (df_view is not None and not df_view.empty and COL_ORDER_NO in df_view.columns) else 0
 
     latest_done = df_view[COL_DONE].max() if (df_view is not None and COL_DONE in df_view.columns) else pd.NaT
@@ -1158,7 +1139,7 @@ def compute_kpis(df_view: pd.DataFrame):
             top_bp_qty_name = str(g.index[0])
             top_bp_qty_val = f"{float(g.iloc[0]):,.0f}"
 
-    # ✅ 수정: 출고건수 TOP BP = 주문번호 distinct by BP
+    # ✅ 출고건수 TOP BP = 주문번호 distinct by BP
     top_bp_cnt_name = "-"
     top_bp_cnt_val = "-"
     if df_view is not None and (not df_view.empty) and all(c in df_view.columns for c in [COL_BP, COL_ORDER_NO]):
@@ -1331,6 +1312,34 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
                             safe_rerun()
 
 
+def format_done_range(done_min, done_max) -> str:
+    """
+    ✅ 상세 화면 작업완료 표기 개선:
+    - 둘 다 없으면 "-"
+    - 하나만 있으면 그 날짜
+    - 둘 다 있고 같은 날이면 단일 날짜
+    - 다르면 "min ~ max"
+    """
+    if pd.isna(done_min) and pd.isna(done_max):
+        return "-"
+
+    dmin = pd.to_datetime(done_min, errors="coerce")
+    dmax = pd.to_datetime(done_max, errors="coerce")
+
+    if pd.isna(dmin) and pd.isna(dmax):
+        return "-"
+
+    if pd.isna(dmin):
+        return fmt_date(dmax)
+    if pd.isna(dmax):
+        return fmt_date(dmin)
+
+    if dmin.date() == dmax.date():
+        return fmt_date(dmin)
+
+    return f"{fmt_date(dmin)} ~ {fmt_date(dmax)}"
+
+
 # =========================
 # Main
 # =========================
@@ -1340,7 +1349,7 @@ st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래�
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
     for k in list(st.session_state.keys()):
-        if k.startswith(("cal_", "f_", "sku_", "wk_", "m_")) or k in ("nav_menu", "monthly_report_text"):
+        if k.startswith(("cal_", "f_", "sku_", "wk_", "m_")) or k in ("nav_menu", "monthly_report_text", "_prev_nav_menu"):
             del st.session_state[k]
     safe_rerun()
 
@@ -1414,7 +1423,7 @@ df_view = pool3.copy()
 if st.session_state["f_bp"] != "전체":
     df_view = df_view[df_view[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
 
-# (대표행 df_rep는 더 이상 출고건수에 사용하지 않지만, 기존 구조 유지 차원에서 남겨둠)
+# (대표행은 유지하되, 출고건수 집계에는 사용하지 않음)
 df_rep = df_view[df_view["_is_rep"]].copy() if "_is_rep" in df_view.columns else pd.DataFrame()
 
 # =========================
@@ -1468,14 +1477,29 @@ nav = st.radio(
     key="nav_menu"
 )
 
+# ✅ (요청사항 1) 메뉴 이동 시 ① 출고 캘린더는 항상 캘린더 메인으로 진입
+prev_nav = st.session_state.get("_prev_nav_menu", None)
+if prev_nav != nav:
+    if nav == "① 출고 캘린더":
+        st.session_state["cal_view"] = "calendar"
+        st.session_state["cal_selected_date"] = None
+        st.session_state["cal_selected_bp"] = ""
+        st.session_state["cal_expanded"] = set()
+
+    if prev_nav == "① 출고 캘린더" and nav != "① 출고 캘린더":
+        st.session_state["cal_view"] = "calendar"
+        st.session_state["cal_selected_date"] = None
+        st.session_state["cal_selected_bp"] = ""
+        st.session_state["cal_expanded"] = set()
+
+    st.session_state["_prev_nav_menu"] = nav
+
 # =========================
 # ① 출고 캘린더
 # =========================
 if nav == "① 출고 캘린더":
     init_calendar_state()
 
-    # 캘린더는 "월 필터" 무시(캘린더 자체 월 선택)
-    # (거래처구분1/2, BP 필터만 반영)
     cal_pool = cal_agg.copy()
     if st.session_state["f_cust1"] != "전체":
         cal_pool = cal_pool[cal_pool[COL_CUST1].astype(str).str.strip() == st.session_state["f_cust1"]]
@@ -1484,7 +1508,6 @@ if nav == "① 출고 캘린더":
     if st.session_state["f_bp"] != "전체":
         cal_pool = cal_pool[cal_pool[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
 
-    # 기본 월: 필터 범위 내 최신 출고월
     if st.session_state["cal_ym"].strip() == "":
         if cal_pool is not None and (not cal_pool.empty) and "_ship_ym" in cal_pool.columns:
             st.session_state["cal_ym"] = cal_pool["_ship_ym"].dropna().astype(str).max()
@@ -1506,7 +1529,6 @@ if nav == "① 출고 캘린더":
             st.warning("상세 조회 대상이 없습니다. 캘린더에서 BP를 클릭해 주세요.")
             st.stop()
 
-        # 상세는 거래처1/2 필터까지만(월 필터 무시) + BP 선택은 캘린더에서 넘어온 값 사용
         d = pool2.copy()
         if not need_cols(d, ["_ship_date", COL_BP, COL_QTY, COL_ITEM_CODE, COL_ITEM_NAME], "출고 상세"):
             st.stop()
@@ -1524,7 +1546,8 @@ if nav == "① 출고 캘린더":
         st.markdown(f"- **BP명:** {html.escape(str(bp_s))}")
         st.markdown(f"- **요청수량 합:** {total_qty2:,}")
         if COL_DONE in sub.columns:
-            st.markdown(f"- **작업완료:** {fmt_date(done_min)} ~ {fmt_date(done_max)}")
+            # ✅ (요청사항 2) 단일 날짜면 단일로 표기
+            st.markdown(f"- **작업완료:** {format_done_range(done_min, done_max)}")
         st.divider()
 
         g = (
@@ -1820,7 +1843,7 @@ elif nav == "⑤ 국가별 조회":
     ).reset_index()
     out = out.rename(columns={"p90_tmp": "리드타임 느린 상위10% 기준(P90)"})
 
-    # ✅ 수정: 출고건수 = 주문번호 distinct (거래처구분2별)
+    # ✅ 출고건수 = 주문번호 distinct (거래처구분2별)
     tmp = base[[COL_CUST2, COL_ORDER_NO]].copy()
     tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_CUST2)["_ord"].nunique()
@@ -1855,7 +1878,7 @@ elif nav == "⑥ BP명별 조회":
         집계행수_표본=(COL_BP, "size"),
     ).reset_index()
 
-    # ✅ 수정: 출고건수 = 주문번호 distinct (BP별)
+    # ✅ 출고건수 = 주문번호 distinct (BP별)
     tmp = base[[COL_BP, COL_ORDER_NO]].copy()
     tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_BP)["_ord"].nunique()
