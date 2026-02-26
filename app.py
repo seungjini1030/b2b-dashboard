@@ -6,6 +6,10 @@
 # 2) 새탭 방지: 캘린더 BP 클릭/이전달/다음달/더보기/접기/뒤로가기 => st.button + session_state
 # 3) 10만행 대비: df.apply(axis=1) 제거(주차 벡터화) + 캘린더용 집계(cal_agg) 캐시 생성
 # 4) 캘린더 표기: 태그(🟦 해외 / 🟩 국내)
+#
+# ✅ 이번 수정(요청사항)
+# - 출고건수 정의를 대표행(TRUE) 기반이 아닌,
+#   "주문번호(distinct)" 기준으로 전 화면( KPI/TopBP/코멘트/국가별/BP별 ) 통일
 # ==========================================
 
 import re
@@ -610,6 +614,9 @@ def _fmt_delta(diff: float) -> str:
 
 
 def _clean_nunique(series: pd.Series) -> int:
+    """
+    ✅ distinct 카운트 공통(주문번호)
+    """
     if series is None:
         return 0
     s = series.astype(str).str.strip()
@@ -624,11 +631,13 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
 
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
-    if df is None or df.empty:
+    """
+    ✅ 수정: 출고건수 = 주문번호(distinct) 통일
+    (이전: 대표행 TRUE 합계)
+    """
+    if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
-    if "_is_rep" in df.columns:
-        return int(df["_is_rep"].sum())
-    return int(df.shape[0])
+    return _clean_nunique(df[COL_ORDER_NO])
 
 
 def _get_qty(df: pd.DataFrame) -> int:
@@ -1064,7 +1073,7 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
     if COL_CLASS in df.columns:
         df = df[df[COL_CLASS].astype(str).str.strip().isin(KEEP_CLASSES)].copy()
 
-    # 대표행
+    # 대표행(계속 유지: 다른 용도(원본 로직) 대비)
     df["_is_rep"] = to_bool_true(df[COL_MAIN]) if COL_MAIN in df.columns else False
 
     # ✅ 주차 라벨/키 벡터화(출고일 우선, 없으면 작업완료일)
@@ -1127,9 +1136,12 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 # =========================
 # KPI
 # =========================
-def compute_kpis(df_view: pd.DataFrame, df_rep: pd.DataFrame):
+def compute_kpis(df_view: pd.DataFrame):
     total_qty = float(df_view[COL_QTY].fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
-    total_cnt = int(df_rep.shape[0]) if df_rep is not None else 0
+
+    # ✅ 수정: 출고건수 = 주문번호 distinct
+    total_cnt = _clean_nunique(df_view[COL_ORDER_NO]) if (df_view is not None and not df_view.empty and COL_ORDER_NO in df_view.columns) else 0
+
     latest_done = df_view[COL_DONE].max() if (df_view is not None and COL_DONE in df_view.columns) else pd.NaT
 
     avg_lt2_overseas = None
@@ -1146,17 +1158,22 @@ def compute_kpis(df_view: pd.DataFrame, df_rep: pd.DataFrame):
             top_bp_qty_name = str(g.index[0])
             top_bp_qty_val = f"{float(g.iloc[0]):,.0f}"
 
+    # ✅ 수정: 출고건수 TOP BP = 주문번호 distinct by BP
     top_bp_cnt_name = "-"
     top_bp_cnt_val = "-"
-    if df_rep is not None and (not df_rep.empty) and COL_BP in df_rep.columns:
-        g2 = df_rep.groupby(COL_BP).size().sort_values(ascending=False)
-        if not g2.empty:
-            top_bp_cnt_name = str(g2.index[0])
-            top_bp_cnt_val = f"{int(g2.iloc[0]):,}"
+    if df_view is not None and (not df_view.empty) and all(c in df_view.columns for c in [COL_BP, COL_ORDER_NO]):
+        tmp = df_view[[COL_BP, COL_ORDER_NO]].copy()
+        tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+        tmp = tmp.dropna(subset=["_ord"])
+        if not tmp.empty:
+            g2 = tmp.groupby(COL_BP)["_ord"].nunique().sort_values(ascending=False)
+            if not g2.empty:
+                top_bp_cnt_name = str(g2.index[0])
+                top_bp_cnt_val = f"{int(g2.iloc[0]):,}"
 
     return {
         "total_qty": total_qty,
-        "total_cnt": total_cnt,
+        "total_cnt": int(total_cnt),
         "latest_done": latest_done,
         "avg_lt2_overseas": avg_lt2_overseas,
         "top_bp_qty_name": top_bp_qty_name,
@@ -1397,12 +1414,13 @@ df_view = pool3.copy()
 if st.session_state["f_bp"] != "전체":
     df_view = df_view[df_view[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
 
+# (대표행 df_rep는 더 이상 출고건수에 사용하지 않지만, 기존 구조 유지 차원에서 남겨둠)
 df_rep = df_view[df_view["_is_rep"]].copy() if "_is_rep" in df_view.columns else pd.DataFrame()
 
 # =========================
 # KPI cards
 # =========================
-k = compute_kpis(df_view, df_rep)
+k = compute_kpis(df_view)
 
 st.markdown(
     f"""
@@ -1412,7 +1430,7 @@ st.markdown(
         <div class="kpi-value">{k['total_qty']:,.0f}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-title">총 출고건수(합)</div>
+        <div class="kpi-title">총 출고건수(합) <span style="color:#6b7280;font-size:0.85rem;">(주문번호 distinct)</span></div>
         <div class="kpi-value">{k['total_cnt']:,}</div>
       </div>
       <div class="kpi-card">
@@ -1429,7 +1447,7 @@ st.markdown(
         <div class="kpi-muted">{html.escape(k['top_bp_qty_name'])}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-title">출고건수 TOP BP</div>
+        <div class="kpi-title">출고건수 TOP BP <span style="color:#6b7280;font-size:0.85rem;">(주문번호 distinct)</span></div>
         <div class="kpi-big">{html.escape(k['top_bp_cnt_val'])}</div>
         <div class="kpi-muted">{html.escape(k['top_bp_cnt_name'])}</div>
       </div>
@@ -1789,7 +1807,7 @@ elif nav == "④ 월간요약":
 # =========================
 elif nav == "⑤ 국가별 조회":
     st.subheader("국가별 조회 (거래처구분2 기준)")
-    if not need_cols(df_view, [COL_CUST2, COL_QTY, COL_LT2], "국가별 조회"):
+    if not need_cols(df_view, [COL_CUST2, COL_QTY, COL_LT2, COL_ORDER_NO], "국가별 조회"):
         st.stop()
 
     base = df_view.copy()
@@ -1802,7 +1820,10 @@ elif nav == "⑤ 국가별 조회":
     ).reset_index()
     out = out.rename(columns={"p90_tmp": "리드타임 느린 상위10% 기준(P90)"})
 
-    rep_cnt = base[base["_is_rep"]].groupby(COL_CUST2).size()
+    # ✅ 수정: 출고건수 = 주문번호 distinct (거래처구분2별)
+    tmp = base[[COL_CUST2, COL_ORDER_NO]].copy()
+    tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_CUST2)["_ord"].nunique()
     out["출고건수"] = out[COL_CUST2].astype(str).map(rep_cnt).fillna(0).astype(int)
 
     for c in ["평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준", "리드타임 느린 상위10% 기준(P90)"]:
@@ -1821,7 +1842,7 @@ elif nav == "⑤ 국가별 조회":
 # =========================
 elif nav == "⑥ BP명별 조회":
     st.subheader("BP명별 조회")
-    if not need_cols(df_view, [COL_BP, COL_QTY, COL_LT2], "BP명별 조회"):
+    if not need_cols(df_view, [COL_BP, COL_QTY, COL_LT2, COL_ORDER_NO], "BP명별 조회"):
         st.stop()
 
     base = df_view.copy()
@@ -1834,7 +1855,10 @@ elif nav == "⑥ BP명별 조회":
         집계행수_표본=(COL_BP, "size"),
     ).reset_index()
 
-    rep_cnt = base[base["_is_rep"]].groupby(COL_BP).size()
+    # ✅ 수정: 출고건수 = 주문번호 distinct (BP별)
+    tmp = base[[COL_BP, COL_ORDER_NO]].copy()
+    tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_BP)["_ord"].nunique()
     out["출고건수"] = out[COL_BP].astype(str).map(rep_cnt).fillna(0).astype(int)
 
     out["요청수량_합"] = pd.to_numeric(out["요청수량_합"], errors="coerce").fillna(0).round(0).astype(int)
