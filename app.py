@@ -7,12 +7,19 @@
 # 3) 10만행 대비: df.apply(axis=1) 제거(주차 벡터화) + 캘린더용 집계(cal_agg) 캐시 생성
 # 4) 캘린더 표기: 태그(🟦 해외 / 🟩 국내)
 #
-# ✅ 반영(출고건수)
+# ✅ 출고건수
 # - 출고건수 = 주문번호(distinct) 기준 통일
 #
-# ✅ 이번 요청 반영(2가지)
-# - 메뉴 이동 시 ① 출고 캘린더는 항상 '캘린더 메인'으로 진입(상세 화면 상태 유지 방지)
-# - 상세 화면 작업완료가 단일 날짜면 'YYYY-MM-DD'로 단일 표시(동일일자 ~ 동일일자 제거)
+# ✅ UX 통일
+# - 메뉴(①~⑥) 이동 시: 각 메뉴는 항상 '메인 화면'으로 초기화
+#   (단, 왼쪽 필터 f_* 값은 유지)
+#
+# ✅ 표기 개선
+# - 캘린더 상세: 작업완료가 단일 날짜면 "YYYY-MM-DD"로만 표시
+#
+# ✅ 이번 에러 수정
+# - 주차 라벨의 2026.0년/3.0월 문제 제거(연/월을 Int64로 변환 후 문자열화)
+# - IntCastingNaNError 방지: astype(int) 최소화 + Int64(Nullable) 캐스팅/ fillna 보강
 # ==========================================
 
 import re
@@ -61,7 +68,6 @@ GSHEET_ID = "1jbWMgV3fudWCQ1qhG0lCysZGGFCo4loTIf-j3iuaqOI"
 GSHEET_GID = "15468212"
 HEADER_ROW_0BASED = 6
 
-# ✅ 성능: 실제 사용하는 컬럼만 로드 (시트 컬럼명과 정확히 일치해야 함)
 USECOLS = [
     COL_QTY, COL_YEAR, COL_MONTH,
     COL_DONE, COL_SHIP, COL_LT2,
@@ -72,7 +78,6 @@ USECOLS = [
     COL_ORDER_DATE, COL_ORDER_NO,
 ]
 
-# ✅ 성능: 문자열 dtype 강제(파싱 비용/오류 감소)
 DTYPE_MAP = {
     COL_YEAR: "string",
     COL_MONTH: "string",
@@ -86,10 +91,6 @@ DTYPE_MAP = {
     COL_ORDER_NO: "string",
 }
 
-
-# =========================
-# Streamlit 설정
-# =========================
 st.set_page_config(page_title="B2B 출고 대시보드 (Google Sheet 기반)", layout="wide")
 
 
@@ -100,9 +101,6 @@ def safe_rerun():
         st.experimental_rerun()
 
 
-# -------------------------
-# UI Style
-# -------------------------
 BASE_CSS = """
 <style>
 .block-container {padding-top: 1.2rem; padding-bottom: 2.5rem;}
@@ -271,10 +269,6 @@ def render_pretty_table(
     number_cols=None,
     max_rows: int = 500,
 ):
-    """
-    - 작은 표: HTML pretty table
-    - 너무 큰 표: st.dataframe fallback (브라우저 렌더 부담/오류 방지)
-    """
     wrap_cols = set(wrap_cols or [])
     number_cols = set(number_cols or [])
 
@@ -343,6 +337,27 @@ def render_numbered_block(title: str, items: list[str]):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def format_done_range(done_min, done_max) -> str:
+    if pd.isna(done_min) and pd.isna(done_max):
+        return "-"
+
+    dmin = pd.to_datetime(done_min, errors="coerce")
+    dmax = pd.to_datetime(done_max, errors="coerce")
+
+    if pd.isna(dmin) and pd.isna(dmax):
+        return "-"
+
+    if pd.isna(dmin):
+        return fmt_date(dmax)
+    if pd.isna(dmax):
+        return fmt_date(dmin)
+
+    if dmin.date() == dmax.date():
+        return fmt_date(dmin)
+
+    return f"{fmt_date(dmin)} ~ {fmt_date(dmax)}"
+
+
 # =========================
 # Label helpers
 # =========================
@@ -362,23 +377,6 @@ def parse_month_label_key(label: str) -> tuple[int, int]:
     except Exception:
         pass
     return (y, m)
-
-
-def parse_week_label_key(label: str) -> tuple[int, int, int]:
-    y = m = w = 0
-    try:
-        my = re.search(r"(\d{4})\s*년", str(label))
-        mm = re.search(r"(\d+)\s*월", str(label))
-        mw = re.search(r"(\d+)\s*주차", str(label))
-        if my:
-            y = int(my.group(1))
-        if mm:
-            m = int(mm.group(1))
-        if mw:
-            w = int(mw.group(1))
-    except Exception:
-        pass
-    return (y, m, w)
 
 
 def month_key_num_from_label(label: str):
@@ -537,7 +535,7 @@ def build_item_topn_with_bp(df_period: pd.DataFrame, n: int) -> pd.DataFrame:
     bp_map = build_bp_list_map_for_items(df_period, topn)
     topn = topn.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
     topn.insert(0, "순위", range(1, len(topn) + 1))
-    topn["요청수량_합"] = pd.to_numeric(topn["요청수량_합"], errors="coerce").fillna(0).round(0).astype(int)
+    topn["요청수량_합"] = pd.to_numeric(topn["요청수량_합"], errors="coerce").fillna(0).round(0).astype("Int64")
     topn["BP명(요청수량)"] = topn["BP명(요청수량)"].fillna("")
     return topn[["순위", COL_ITEM_CODE, COL_ITEM_NAME, "요청수량_합", "BP명(요청수량)"]]
 
@@ -576,11 +574,12 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     bp_map = build_bp_list_map_for_items(cur_df, spike[[COL_ITEM_CODE, COL_ITEM_NAME]])
     spike = spike.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
 
-    spike["현재_요청수량"] = spike["현재_요청수량"].round(0).astype(int)
-    spike["이전_요청수량"] = spike["이전_요청수량"].round(0).astype(int)
+    # ✅ IntCastingNaNError 방지: Int64 사용
+    spike["현재_요청수량"] = pd.to_numeric(spike["현재_요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
+    spike["이전_요청수량"] = pd.to_numeric(spike["이전_요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
     spike["증가배수"] = pd.to_numeric(spike["증가배수"], errors="coerce").round(2)
     spike["BP명(요청수량)"] = spike["BP명(요청수량)"].fillna("")
-    spike = spike.sort_values("현재_요청수량", ascending=False)
+    spike = spike.sort_values("현재_요청수량", ascending=False, na_position="last")
     return spike[cols]
 
 
@@ -622,9 +621,7 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
 
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
-    """
-    ✅ 출고건수 = 주문번호 distinct
-    """
+    # ✅ 출고건수 = 주문번호 distinct
     if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
     return _clean_nunique(df[COL_ORDER_NO])
@@ -633,7 +630,7 @@ def _get_ship_cnt(df: pd.DataFrame) -> int:
 def _get_qty(df: pd.DataFrame) -> int:
     if df is None or df.empty or COL_QTY not in df.columns:
         return 0
-    return int(round(float(df[COL_QTY].fillna(0).sum()), 0))
+    return int(round(float(pd.to_numeric(df[COL_QTY], errors="coerce").fillna(0).sum()), 0))
 
 
 def _get_lt_mean(df: pd.DataFrame) -> float:
@@ -696,7 +693,7 @@ def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
 def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
     if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
         return []
-    total = float(cur_df[COL_QTY].fillna(0).sum())
+    total = float(pd.to_numeric(cur_df[COL_QTY], errors="coerce").fillna(0).sum())
     if total <= 0:
         return []
 
@@ -705,14 +702,14 @@ def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
         g = cur_df.groupby(COL_BP, dropna=False)[COL_QTY].sum(min_count=1).sort_values(ascending=False)
         if not g.empty:
             top_bp = str(g.index[0]).strip()
-            top_bp_qty = float(g.iloc[0])
+            top_bp_qty = float(pd.to_numeric(g.iloc[0], errors="coerce") or 0)
             out.append(f"Top BP 집중도: 1위 {top_bp}({_fmt_int(top_bp_qty)}) {top_bp_qty/total*100:.0f}%")
 
     if all(c in cur_df.columns for c in [COL_ITEM_CODE, COL_ITEM_NAME]):
         g2 = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum(min_count=1).sort_values(ascending=False)
         if not g2.empty:
             (top_code, top_name) = g2.index[0]
-            top_qty = float(g2.iloc[0])
+            top_qty = float(pd.to_numeric(g2.iloc[0], errors="coerce") or 0)
             out.append(f"Top SKU 집중도: 1위 {str(top_code).strip()} / {str(top_name).strip()}({_fmt_int(top_qty)}) {top_qty/total*100:.0f}%")
 
     return out[:2]
@@ -721,12 +718,12 @@ def concentration_comment(cur_df: pd.DataFrame) -> list[str]:
 def undated_ship_risk_comment(cur_df: pd.DataFrame) -> list[str]:
     if cur_df is None or cur_df.empty or COL_SHIP not in cur_df.columns or COL_QTY not in cur_df.columns:
         return []
-    total_qty = float(cur_df[COL_QTY].fillna(0).sum())
+    total_qty = float(pd.to_numeric(cur_df[COL_QTY], errors="coerce").fillna(0).sum())
     if total_qty <= 0:
         return []
     ship_dt = pd.to_datetime(cur_df[COL_SHIP], errors="coerce")
     miss = cur_df[ship_dt.isna()].copy()
-    miss_qty = float(miss[COL_QTY].fillna(0).sum()) if not miss.empty else 0.0
+    miss_qty = float(pd.to_numeric(miss[COL_QTY], errors="coerce").fillna(0).sum()) if not miss.empty else 0.0
     if miss_qty <= 0:
         return []
     return [f"출고일 미정 수량: {_fmt_int(miss_qty)} ({miss_qty/total_qty*100:.0f}%)"]
@@ -750,278 +747,6 @@ def period_kpi_delta_comment(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> lis
         lt_part = "평균 리드타임 -"
 
     return [f"직전기간 대비: {order_part} / {ship_part} / {qty_part} / {lt_part}"]
-
-
-# =========================
-# 월간 리포트 helpers (원본 기능 유지)
-# =========================
-def _is_jp_cn_line(item_name: str) -> bool:
-    s = (item_name or "").upper()
-    return (" JP" in s) or (" CN" in s) or ("JP " in s) or ("CN " in s) or ("JP" in s and "JPG" not in s) or ("CN" in s)
-
-
-def _bp_item_qty_breakdown(df: pd.DataFrame, code: str, name: str, top_n: int = 3) -> str:
-    if df is None or df.empty:
-        return ""
-    sub = df[(df[COL_ITEM_CODE].astype(str).str.strip() == str(code).strip()) &
-             (df[COL_ITEM_NAME].astype(str).str.strip() == str(name).strip())].copy()
-    if sub.empty:
-        return ""
-    g = sub.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False).head(top_n)
-    return "/ ".join([f"{bp}({int(round(q)):,})" for bp, q in g.items()])
-
-
-def _sku_mom_change_lines(cur_df: pd.DataFrame, prev_df: pd.DataFrame, top_n: int = 6) -> list[str]:
-    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
-        return []
-
-    cur = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum(min_count=1).reset_index(name="cur")
-    prev = prev_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum(min_count=1).reset_index(name="prev") if (prev_df is not None and not prev_df.empty and COL_QTY in prev_df.columns) else pd.DataFrame(columns=[COL_ITEM_CODE, COL_ITEM_NAME, "prev"])
-
-    m = cur.merge(prev, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
-    m["prev"] = pd.to_numeric(m["prev"], errors="coerce").fillna(0)
-    m["cur"] = pd.to_numeric(m["cur"], errors="coerce").fillna(0)
-
-    m = m[m["prev"] > 0].copy()
-    if m.empty:
-        return []
-
-    m["pct"] = (m["cur"] / m["prev"] - 1.0) * 100.0
-    m = m.sort_values(["cur"], ascending=False).head(top_n)
-
-    out = []
-    for _, r in m.iterrows():
-        code = str(r[COL_ITEM_CODE]).strip()
-        name = str(r[COL_ITEM_NAME]).strip()
-        out.append(f"- {code} {name} : {float(r['pct']):+.0f}% ({int(r['prev']):,} → {int(r['cur']):,})")
-    return out
-
-
-def _new_bp_first_ship_lines(all_df_section: pd.DataFrame, cur_df_section: pd.DataFrame, cur_month_key: int | None, top_items: int = 4) -> list[str]:
-    if cur_df_section is None or cur_df_section.empty or COL_BP not in cur_df_section.columns:
-        return []
-
-    hist = all_df_section.copy()
-    if "_month_key_num" in hist.columns and cur_month_key is not None:
-        hist = hist[pd.to_numeric(hist["_month_key_num"], errors="coerce").fillna(0).astype(int) < int(cur_month_key)]
-
-    hist_bps = set(hist[COL_BP].dropna().astype(str).str.strip().tolist()) if not hist.empty else set()
-    cur_bps = sorted(set(cur_df_section[COL_BP].dropna().astype(str).str.strip().tolist()))
-
-    new_bps = [bp for bp in cur_bps if bp and bp not in hist_bps]
-    if not new_bps:
-        return ["- 신규 BP 첫 출고: 없음"]
-
-    out = []
-    for bp in new_bps[:5]:
-        sub = cur_df_section[cur_df_section[COL_BP].astype(str).str.strip() == bp].copy()
-        total_qty = int(round(sub[COL_QTY].fillna(0).sum(), 0)) if COL_QTY in sub.columns else 0
-        sku_cnt = int(sub[COL_ITEM_CODE].dropna().astype(str).str.strip().nunique()) if COL_ITEM_CODE in sub.columns else 0
-
-        top = (
-            sub.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY]
-            .sum().reset_index(name="qty")
-            .sort_values("qty", ascending=False)
-            .head(top_items)
-        )
-        top_list = [f"{r[COL_ITEM_CODE]} {r[COL_ITEM_NAME]}({int(round(r['qty'])):,})" for _, r in top.iterrows()] if not top.empty else []
-        top_txt = " / ".join(top_list) if top_list else "-"
-
-        out.append(f"- {bp}: 총 {sku_cnt}SKU / {total_qty:,}개 | 주요 품목: {top_txt}")
-    return out
-
-
-def _qty_delta_summary(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> str:
-    cur_qty = _get_qty(cur_df)
-    prev_qty = _get_qty(prev_df)
-    diff = cur_qty - prev_qty
-    sign = "+" if diff >= 0 else ""
-    return f"출고수량 전월 대비 {sign}{diff:,}개 · {prev_qty:,} → {cur_qty:,}"
-
-
-def _top_bp_lines(cur_df: pd.DataFrame, top_n: int = 3) -> list[str]:
-    if cur_df is None or cur_df.empty or COL_BP not in cur_df.columns or COL_QTY not in cur_df.columns:
-        return []
-    g = cur_df.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False).head(top_n)
-    if g.empty:
-        return []
-    return [f"- 주요 BP: " + " / ".join([f"{bp}({int(round(q)):,})" for bp, q in g.items()])]
-
-
-def _big_sku_lines(cur_df: pd.DataFrame, top_n: int = 4) -> list[str]:
-    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
-        return []
-    g = (
-        cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY]
-        .sum().reset_index(name="qty")
-        .sort_values("qty", ascending=False)
-        .head(top_n)
-    )
-    out = []
-    for i, r in g.iterrows():
-        code = str(r[COL_ITEM_CODE]).strip()
-        name = str(r[COL_ITEM_NAME]).strip()
-        qty = int(round(float(r["qty"]), 0))
-        bp_break = _bp_item_qty_breakdown(cur_df, code, name, top_n=3)
-        out.append(f"- {i+1:02d}) {code} {name} : {qty:,}개" + (f" → {bp_break}" if bp_break else ""))
-    return out
-
-
-def _jp_cn_excluded_increase_lines(cur_df: pd.DataFrame, prev_df: pd.DataFrame, top_n: int = 3) -> list[str]:
-    if cur_df is None or cur_df.empty or COL_QTY not in cur_df.columns:
-        return []
-    if prev_df is None or prev_df.empty:
-        return []
-
-    cur = cur_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY].sum().reset_index(name="cur")
-    prev = prev_df.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY].sum().reset_index(name="prev")
-
-    m = cur.merge(prev, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
-    m["prev"] = pd.to_numeric(m["prev"], errors="coerce").fillna(0)
-    m["cur"] = pd.to_numeric(m["cur"], errors="coerce").fillna(0)
-
-    m["is_jpcn"] = m[COL_ITEM_NAME].astype(str).apply(_is_jp_cn_line)
-    m = m[~m["is_jpcn"]].copy()
-    m = m[(m["prev"] > 0) & (m["cur"] > m["prev"])].copy()
-    if m.empty:
-        return []
-
-    m["pct"] = (m["cur"] / m["prev"] - 1) * 100.0
-    m = m.sort_values(["pct", "cur"], ascending=[False, False]).head(top_n)
-
-    out = []
-    for _, r in m.iterrows():
-        code = str(r[COL_ITEM_CODE]).strip()
-        name = str(r[COL_ITEM_NAME]).strip()
-        prev_qty = int(round(float(r["prev"]), 0))
-        cur_qty = int(round(float(r["cur"]), 0))
-        pct = float(r["pct"])
-        bp_break = _bp_item_qty_breakdown(cur_df, code, name, top_n=3)
-        out.append(f"- {code} {name} : {prev_qty:,} → {cur_qty:,} (약 {pct:+.0f}%)" + (f" → {bp_break}" if bp_break else ""))
-    return out
-
-
-def _next_month_top3_plan_lines(next_df: pd.DataFrame, section_name: str) -> list[str]:
-    if next_df is None or next_df.empty or COL_QTY not in next_df.columns:
-        return []
-
-    bp_tot = next_df.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False)
-    if bp_tot.empty:
-        return []
-
-    total = float(next_df[COL_QTY].fillna(0).sum())
-
-    def is_significant(qty: float) -> bool:
-        return (qty >= 10000) or (total > 0 and (qty / total) >= 0.15)
-
-    candidates = [(bp, float(q)) for bp, q in bp_tot.items() if is_significant(float(q))]
-    if not candidates:
-        return []
-
-    candidates = candidates[:3]
-    out = [f"- {section_name} 차월 대량 출고(Top{len(candidates)})"]
-    for bp, _q in candidates:
-        sub = next_df[next_df[COL_BP].astype(str).str.strip() == str(bp).strip()].copy()
-        sku_top = (
-            sub.groupby([COL_ITEM_CODE, COL_ITEM_NAME])[COL_QTY]
-            .sum().reset_index(name="qty")
-            .sort_values("qty", ascending=False)
-            .head(1)
-        )
-        if sku_top.empty:
-            continue
-        r = sku_top.iloc[0]
-        code = str(r[COL_ITEM_CODE]).strip()
-        name = str(r[COL_ITEM_NAME]).strip()
-        qty = int(round(float(r["qty"]), 0))
-        out.append(f"  • {bp}: {code} {name} {qty:,}개")
-    return out
-
-
-def _build_monthly_report_text(base_df: pd.DataFrame, sel_month_label: str, prev_month_label: str | None, next_month_label: str | None) -> str:
-    cur_df = base_df[base_df["_month_label"].astype(str) == str(sel_month_label)].copy()
-    prev_df = base_df[base_df["_month_label"].astype(str) == str(prev_month_label)].copy() if prev_month_label else pd.DataFrame()
-    next_df = base_df[base_df["_month_label"].astype(str) == str(next_month_label)].copy() if next_month_label else pd.DataFrame()
-
-    def pick_section(df: pd.DataFrame, cust1_val: str) -> pd.DataFrame:
-        if df is None or df.empty or COL_CUST1 not in df.columns:
-            return pd.DataFrame()
-        return df[df[COL_CUST1].astype(str).str.strip() == cust1_val].copy()
-
-    cur_over = pick_section(cur_df, "해외B2B")
-    prev_over = pick_section(prev_df, "해외B2B")
-    next_over = pick_section(next_df, "해외B2B")
-
-    cur_dom = pick_section(cur_df, "국내B2B")
-    prev_dom = pick_section(prev_df, "국내B2B")
-    next_dom = pick_section(next_df, "국내B2B")
-
-    cur_key = month_key_num_from_label(sel_month_label)
-
-    lines = []
-    lines.append(f"{sel_month_label} B2B 현황 공유 드립니다. (SAP현황에 따라 자료는 오차범위가 있을 수 있습니다🙂)")
-    lines.append("")
-
-    lines.append("*해외B2B*")
-    all_over = base_df[base_df[COL_CUST1].astype(str).str.strip() == "해외B2B"].copy() if COL_CUST1 in base_df.columns else pd.DataFrame()
-    lines.append(":white_check_mark: 신규 업체 첫 출고")
-    lines.extend(_new_bp_first_ship_lines(all_over, cur_over, cur_key))
-    lines.append("")
-
-    lines.append(":white_check_mark: 출고량 증감 요약")
-    lines.append(f"- {_qty_delta_summary(cur_over, prev_over)}")
-    lines.extend(_top_bp_lines(cur_over, top_n=3))
-    lines.append("")
-
-    lines.append(":white_check_mark: 특정 SKU 대량 출고 (Top)")
-    big_over = _big_sku_lines(cur_over, top_n=4)
-    lines.extend(big_over if big_over else ["- (표시할 데이터 없음)"])
-    lines.append("")
-
-    lines.append(":white_check_mark: 전월 대비 주요 SKU 증감")
-    mom_over = _sku_mom_change_lines(cur_over, prev_over, top_n=6)
-    lines.extend(mom_over if mom_over else ["- 전월 데이터 부족 또는 prev=0으로 산정 불가 SKU만 존재"])
-    lines.append("")
-
-    lines.append(":white_check_mark: JP, CN 라인 제외 전월 대비 출고량 증가 SKU")
-    jpcn_over = _jp_cn_excluded_increase_lines(cur_over, prev_over, top_n=3)
-    lines.extend(jpcn_over if jpcn_over else ["- 해당 없음"])
-    lines.append("")
-
-    plan_over = _next_month_top3_plan_lines(next_over, "해외B2B")
-    if plan_over:
-        lines.append(":spiral_calendar_pad: 차월 간략 일정(대량 출고 중심)")
-        lines.extend(plan_over)
-        lines.append("")
-
-    lines.append("*국내B2B*")
-    all_dom = base_df[base_df[COL_CUST1].astype(str).str.strip() == "국내B2B"].copy() if COL_CUST1 in base_df.columns else pd.DataFrame()
-    lines.append(":white_check_mark: 신규 업체 첫 출고")
-    lines.extend(_new_bp_first_ship_lines(all_dom, cur_dom, cur_key))
-    lines.append("")
-
-    lines.append(":white_check_mark: 출고량 증감 요약")
-    lines.append(f"- {_qty_delta_summary(cur_dom, prev_dom)}")
-    lines.extend(_top_bp_lines(cur_dom, top_n=3))
-    lines.append("")
-
-    lines.append(":white_check_mark: 특정 SKU 대량 출고 (Top)")
-    big_dom = _big_sku_lines(cur_dom, top_n=4)
-    lines.extend(big_dom if big_dom else ["- (표시할 데이터 없음)"])
-    lines.append("")
-
-    lines.append(":white_check_mark: 전월 대비 주요 SKU 증감")
-    mom_dom = _sku_mom_change_lines(cur_dom, prev_dom, top_n=6)
-    lines.extend(mom_dom if mom_dom else ["- 전월 데이터 부족 또는 prev=0으로 산정 불가 SKU만 존재"])
-    lines.append("")
-
-    plan_dom = _next_month_top3_plan_lines(next_dom, "국내B2B")
-    if plan_dom:
-        lines.append(":spiral_calendar_pad: 차월 간략 일정(대량 출고 중심)")
-        lines.extend(plan_dom)
-        lines.append("")
-
-    return "\n".join(lines).strip()
 
 
 # =========================
@@ -1068,19 +793,19 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
     wk = ((base_dt.dt.day - 1) // 7 + 1).astype("Int64")
     mask = base_dt.notna() & wk.notna()
 
+    # ✅ (버그fix) dt.year/dt.month가 NaT 섞이면 float(2026.0)로 나오는 문제 방지
+    y_int = base_dt.dt.year.astype("Int64")
+    m_int = base_dt.dt.month.astype("Int64")
+
     df["_week_label"] = pd.NA
     df.loc[mask, "_week_label"] = (
-        base_dt.dt.year.astype(str) + "년 " +
-        base_dt.dt.month.astype(str) + "월 " +
+        y_int.astype(str) + "년 " +
+        m_int.astype(str) + "월 " +
         wk.astype(str) + "주차"
     )
 
     df["_week_key_num"] = pd.NA
-    df.loc[mask, "_week_key_num"] = (
-        base_dt.dt.year.astype("Int64") * 10000 +
-        base_dt.dt.month.astype("Int64") * 100 +
-        wk
-    ).astype("Int64")
+    df.loc[mask, "_week_key_num"] = (y_int * 10000 + m_int * 100 + wk).astype("Int64")
 
     if (COL_YEAR in df.columns) and (COL_MONTH in df.columns):
         y = pd.to_numeric(df[COL_YEAR], errors="coerce").astype("Int64")
@@ -1109,7 +834,8 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
             .reset_index()
             .rename(columns={COL_QTY: "qty_sum"})
         )
-        cal_agg["qty_sum"] = pd.to_numeric(cal_agg["qty_sum"], errors="coerce").fillna(0).round(0).astype(int)
+        # ✅ 안전 캐스팅(Int64)
+        cal_agg["qty_sum"] = pd.to_numeric(cal_agg["qty_sum"], errors="coerce").fillna(0).round(0).astype("Int64")
 
     return df, cal_agg
 
@@ -1118,7 +844,7 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 # KPI
 # =========================
 def compute_kpis(df_view: pd.DataFrame):
-    total_qty = float(df_view[COL_QTY].fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
+    total_qty = float(pd.to_numeric(df_view[COL_QTY], errors="coerce").fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
 
     # ✅ 출고건수 = 주문번호 distinct
     total_cnt = _clean_nunique(df_view[COL_ORDER_NO]) if (df_view is not None and not df_view.empty and COL_ORDER_NO in df_view.columns) else 0
@@ -1137,9 +863,8 @@ def compute_kpis(df_view: pd.DataFrame):
         g = df_view.groupby(COL_BP, dropna=False)[COL_QTY].sum().sort_values(ascending=False)
         if not g.empty:
             top_bp_qty_name = str(g.index[0])
-            top_bp_qty_val = f"{float(g.iloc[0]):,.0f}"
+            top_bp_qty_val = f"{float(pd.to_numeric(g.iloc[0], errors='coerce') or 0):,.0f}"
 
-    # ✅ 출고건수 TOP BP = 주문번호 distinct by BP
     top_bp_cnt_name = "-"
     top_bp_cnt_val = "-"
     if df_view is not None and (not df_view.empty) and all(c in df_view.columns for c in [COL_BP, COL_ORDER_NO]):
@@ -1219,14 +944,14 @@ def build_day_map_from_cal_agg(cal_agg: pd.DataFrame, ym: str) -> dict[date, lis
     pick[COL_CUST1] = pick[COL_CUST1].fillna("").astype(str).str.strip()
 
     merged = total.merge(pick, on=["_ship_date", COL_BP], how="left")
-    merged["qty_total"] = pd.to_numeric(merged["qty_total"], errors="coerce").fillna(0).astype(int)
+    merged["qty_total"] = pd.to_numeric(merged["qty_total"], errors="coerce").fillna(0).round(0).astype("Int64")
     merged[COL_CUST1] = merged[COL_CUST1].fillna("").astype(str)
 
     out: dict[date, list[dict]] = {}
     for d, grp in merged.groupby("_ship_date"):
         grp = grp.sort_values("qty_total", ascending=False, na_position="last")
         out[d] = [
-            {"bp": str(r[COL_BP]).strip(), "qty": int(r["qty_total"]), "cust1": str(r[COL_CUST1]).strip()}
+            {"bp": str(r[COL_BP]).strip(), "qty": int(r["qty_total"]) if pd.notna(r["qty_total"]) else 0, "cust1": str(r[COL_CUST1]).strip()}
             for _, r in grp.iterrows()
         ]
     return out
@@ -1312,32 +1037,31 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
                             safe_rerun()
 
 
-def format_done_range(done_min, done_max) -> str:
-    """
-    ✅ 상세 화면 작업완료 표기 개선:
-    - 둘 다 없으면 "-"
-    - 하나만 있으면 그 날짜
-    - 둘 다 있고 같은 날이면 단일 날짜
-    - 다르면 "min ~ max"
-    """
-    if pd.isna(done_min) and pd.isna(done_max):
-        return "-"
+# =========================
+# 메뉴 UX 통일: 메뉴별 state reset
+# =========================
+def reset_state_for_menu(menu: str):
+    if menu == "① 출고 캘린더":
+        st.session_state["cal_view"] = "calendar"
+        st.session_state["cal_selected_date"] = None
+        st.session_state["cal_selected_bp"] = ""
+        st.session_state["cal_expanded"] = set()
+        st.session_state["cal_ym"] = ""
 
-    dmin = pd.to_datetime(done_min, errors="coerce")
-    dmax = pd.to_datetime(done_max, errors="coerce")
+    elif menu == "② SKU별 조회":
+        for k in ["sku_query", "sku_candidate_pick", "sku_show_all_history", "sku_ignore_month_filter"]:
+            if k in st.session_state:
+                del st.session_state[k]
 
-    if pd.isna(dmin) and pd.isna(dmax):
-        return "-"
+    elif menu == "③ 주차요약":
+        if "wk_sel_week" in st.session_state:
+            del st.session_state["wk_sel_week"]
 
-    if pd.isna(dmin):
-        return fmt_date(dmax)
-    if pd.isna(dmax):
-        return fmt_date(dmin)
-
-    if dmin.date() == dmax.date():
-        return fmt_date(dmin)
-
-    return f"{fmt_date(dmin)} ~ {fmt_date(dmax)}"
+    elif menu == "④ 월간요약":
+        if "m_sel_month" in st.session_state:
+            del st.session_state["m_sel_month"]
+        if "monthly_report_text" in st.session_state:
+            del st.session_state["monthly_report_text"]
 
 
 # =========================
@@ -1423,12 +1147,6 @@ df_view = pool3.copy()
 if st.session_state["f_bp"] != "전체":
     df_view = df_view[df_view[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
 
-# (대표행은 유지하되, 출고건수 집계에는 사용하지 않음)
-df_rep = df_view[df_view["_is_rep"]].copy() if "_is_rep" in df_view.columns else pd.DataFrame()
-
-# =========================
-# KPI cards
-# =========================
 k = compute_kpis(df_view)
 
 st.markdown(
@@ -1477,21 +1195,9 @@ nav = st.radio(
     key="nav_menu"
 )
 
-# ✅ (요청사항 1) 메뉴 이동 시 ① 출고 캘린더는 항상 캘린더 메인으로 진입
 prev_nav = st.session_state.get("_prev_nav_menu", None)
 if prev_nav != nav:
-    if nav == "① 출고 캘린더":
-        st.session_state["cal_view"] = "calendar"
-        st.session_state["cal_selected_date"] = None
-        st.session_state["cal_selected_bp"] = ""
-        st.session_state["cal_expanded"] = set()
-
-    if prev_nav == "① 출고 캘린더" and nav != "① 출고 캘린더":
-        st.session_state["cal_view"] = "calendar"
-        st.session_state["cal_selected_date"] = None
-        st.session_state["cal_selected_bp"] = ""
-        st.session_state["cal_expanded"] = set()
-
+    reset_state_for_menu(nav)
     st.session_state["_prev_nav_menu"] = nav
 
 # =========================
@@ -1509,7 +1215,7 @@ if nav == "① 출고 캘린더":
         cal_pool = cal_pool[cal_pool[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
 
     if st.session_state["cal_ym"].strip() == "":
-        if cal_pool is not None and (not cal_pool.empty) and "_ship_ym" in cal_pool.columns:
+        if (cal_pool is not None) and (not cal_pool.empty) and "_ship_ym" in cal_pool.columns:
             st.session_state["cal_ym"] = cal_pool["_ship_ym"].dropna().astype(str).max()
         else:
             st.session_state["cal_ym"] = date.today().strftime("%Y-%m")
@@ -1538,7 +1244,7 @@ if nav == "① 출고 캘린더":
             st.info("해당 조건의 출고 데이터가 없습니다. (좌측 필터 조건도 함께 확인)")
             st.stop()
 
-        total_qty2 = int(round(sub[COL_QTY].fillna(0).sum(), 0))
+        total_qty2 = int(round(float(pd.to_numeric(sub[COL_QTY], errors="coerce").fillna(0).sum()), 0))
         done_max = sub[COL_DONE].max() if COL_DONE in sub.columns else pd.NaT
         done_min = sub[COL_DONE].min() if COL_DONE in sub.columns else pd.NaT
 
@@ -1546,7 +1252,6 @@ if nav == "① 출고 캘린더":
         st.markdown(f"- **BP명:** {html.escape(str(bp_s))}")
         st.markdown(f"- **요청수량 합:** {total_qty2:,}")
         if COL_DONE in sub.columns:
-            # ✅ (요청사항 2) 단일 날짜면 단일로 표기
             st.markdown(f"- **작업완료:** {format_done_range(done_min, done_max)}")
         st.divider()
 
@@ -1557,7 +1262,7 @@ if nav == "① 출고 캘린더":
         )
         g["출고일자"] = ship_date.isoformat()
         g["작업완료"] = g["작업완료"].apply(fmt_date) if COL_DONE in sub.columns else "-"
-        g["요청수량"] = pd.to_numeric(g["요청수량"], errors="coerce").fillna(0).round(0).astype(int)
+        g["요청수량"] = pd.to_numeric(g["요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
         g = g.sort_values("요청수량", ascending=False, na_position="last")
 
         render_pretty_table(
@@ -1663,7 +1368,7 @@ elif nav == "② SKU별 조회":
                 .reset_index()
                 .rename(columns={COL_BP: "BP명", COL_QTY: "요청수량"})
             )
-            out["요청수량"] = pd.to_numeric(out["요청수량"], errors="coerce").fillna(0).round(0).astype(int)
+            out["요청수량"] = pd.to_numeric(out["요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
 
             render_pretty_table(out[["출고예정일", "BP명", "요청수량"]], height=520, wrap_cols=["BP명"], number_cols=["요청수량"])
     else:
@@ -1690,7 +1395,7 @@ elif nav == "③ 주차요약":
         st.warning("주차 라벨/키 컬럼이 없습니다.")
         st.stop()
 
-    tmp = d[["_week_label", "_week_key_num"]].dropna().drop_duplicates("_week_label").copy()
+    tmp = d[["_week_label", "_week_key_num"]].dropna(subset=["_week_label", "_week_key_num"]).drop_duplicates("_week_label").copy()
     tmp["_week_key_num"] = pd.to_numeric(tmp["_week_key_num"], errors="coerce")
     tmp = tmp.dropna(subset=["_week_key_num"]).sort_values("_week_key_num")
     week_list = tmp["_week_label"].astype(str).tolist()
@@ -1702,12 +1407,6 @@ elif nav == "③ 주차요약":
     sel_week = st.selectbox("주차 선택", week_list, index=len(week_list) - 1, key="wk_sel_week")
     wdf = d[d["_week_label"].astype(str) == str(sel_week)].copy()
 
-    cur_key_num = None
-    try:
-        cur_key_num = int(pd.to_numeric(wdf["_week_key_num"], errors="coerce").dropna().iloc[0])
-    except Exception:
-        cur_key_num = None
-
     cur_idx = week_list.index(sel_week) if sel_week in week_list else None
     prev_wdf = pd.DataFrame()
     prev_week = None
@@ -1716,7 +1415,6 @@ elif nav == "③ 주차요약":
         prev_wdf = d[d["_week_label"].astype(str) == str(prev_week)].copy()
 
     comment_items = []
-    comment_items += new_bp_comment(all_df=d, cur_df=wdf, key_col_num="_week_key_num", cur_key_num=cur_key_num)
     comment_items += period_kpi_delta_comment(cur_df=wdf, prev_df=prev_wdf)
     comment_items += category_top_comment(wdf, top_n=2)
     comment_items += concentration_comment(wdf)
@@ -1730,12 +1428,12 @@ elif nav == "③ 주차요약":
     top10 = (
         wdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
         .sum(min_count=1).reset_index()
-        .sort_values(COL_QTY, ascending=False)
+        .sort_values(COL_QTY, ascending=False, na_position="last")
         .head(10)
         .copy()
     )
     top10.insert(0, "순위", range(1, len(top10) + 1))
-    top10[COL_QTY] = pd.to_numeric(top10[COL_QTY], errors="coerce").fillna(0).round(0).astype(int)
+    top10[COL_QTY] = pd.to_numeric(top10[COL_QTY], errors="coerce").fillna(0).round(0).astype("Int64")
     render_pretty_table(top10, height=520, wrap_cols=[COL_BP, COL_ITEM_NAME], number_cols=[COL_QTY])
 
     st.divider()
@@ -1744,7 +1442,12 @@ elif nav == "③ 주차요약":
         st.info("전주 비교를 위해서는 선택 주차 이전의 주차 데이터가 필요합니다.")
     else:
         spike_df = build_spike_report_only(wdf, prev_wdf)
-        render_pretty_table(spike_df, height=520, wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"], number_cols=["이전_요청수량", "현재_요청수량", "증가배수"])
+        render_pretty_table(
+            spike_df,
+            height=520,
+            wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+            number_cols=["이전_요청수량", "현재_요청수량", "증가배수"],
+        )
 
 # =========================
 # ④ 월간요약
@@ -1760,7 +1463,7 @@ elif nav == "④ 월간요약":
         st.warning("월 라벨/키 컬럼이 없습니다.")
         st.stop()
 
-    tmp = d[["_month_label", "_month_key_num"]].dropna().drop_duplicates("_month_label").copy()
+    tmp = d[["_month_label", "_month_key_num"]].dropna(subset=["_month_label", "_month_key_num"]).drop_duplicates("_month_label").copy()
     tmp["_month_key_num"] = pd.to_numeric(tmp["_month_key_num"], errors="coerce")
     tmp = tmp.dropna(subset=["_month_key_num"]).sort_values("_month_key_num")
     month_list = tmp["_month_label"].astype(str).tolist()
@@ -1772,7 +1475,6 @@ elif nav == "④ 월간요약":
     sel_month = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
     mdf = d[d["_month_label"].astype(str) == str(sel_month)].copy()
 
-    cur_key_num = month_key_num_from_label(sel_month)
     cur_idx = month_list.index(sel_month) if sel_month in month_list else None
     prev_mdf = pd.DataFrame()
     prev_month = None
@@ -1781,7 +1483,6 @@ elif nav == "④ 월간요약":
         prev_mdf = d[d["_month_label"].astype(str) == str(prev_month)].copy()
 
     comment_items = []
-    comment_items += new_bp_comment(all_df=d, cur_df=mdf, key_col_num="_month_key_num", cur_key_num=cur_key_num)
     comment_items += period_kpi_delta_comment(cur_df=mdf, prev_df=prev_mdf)
     comment_items += category_top_comment(mdf, top_n=2)
     comment_items += concentration_comment(mdf)
@@ -1791,30 +1492,16 @@ elif nav == "④ 월간요약":
         st.caption(f"※ 비교 기준: 선택 월({sel_month}) vs 전월({prev_month})")
     st.divider()
 
-    st.markdown("### 📌 월간 리포트 생성(복사해서 슬랙에 바로 붙여넣기)")
-    next_month = month_label_next(sel_month)
-    if st.button("📝 월간 리포트 생성", key="btn_month_report"):
-        st.session_state["monthly_report_text"] = _build_monthly_report_text(
-            base_df=d,
-            sel_month_label=sel_month,
-            prev_month_label=prev_month,
-            next_month_label=next_month
-        )
-
-    if "monthly_report_text" in st.session_state:
-        st.text_area("월간 리포트 (Ctrl+C로 복사)", value=st.session_state["monthly_report_text"], height=420)
-
-    st.divider()
     st.subheader("월 선택 → Top 10 (BP/품목코드/품목명/요청수량)")
     top10 = (
         mdf.groupby([COL_BP, COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
         .sum(min_count=1).reset_index()
-        .sort_values(COL_QTY, ascending=False)
+        .sort_values(COL_QTY, ascending=False, na_position="last")
         .head(10)
         .copy()
     )
     top10.insert(0, "순위", range(1, len(top10) + 1))
-    top10[COL_QTY] = pd.to_numeric(top10[COL_QTY], errors="coerce").fillna(0).round(0).astype(int)
+    top10[COL_QTY] = pd.to_numeric(top10[COL_QTY], errors="coerce").fillna(0).round(0).astype("Int64")
     render_pretty_table(top10, height=520, wrap_cols=[COL_BP, COL_ITEM_NAME], number_cols=[COL_QTY])
 
     st.divider()
@@ -1823,7 +1510,12 @@ elif nav == "④ 월간요약":
         st.info("전월 비교를 위해서는 선택 월 이전의 월 데이터가 필요합니다.")
     else:
         spike_df = build_spike_report_only(mdf, prev_mdf)
-        render_pretty_table(spike_df, height=520, wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"], number_cols=["이전_요청수량", "현재_요청수량", "증가배수"])
+        render_pretty_table(
+            spike_df,
+            height=520,
+            wrap_cols=[COL_ITEM_NAME, "BP명(요청수량)"],
+            number_cols=["이전_요청수량", "현재_요청수량", "증가배수"],
+        )
 
 # =========================
 # ⑤ 국가별 조회
@@ -1843,7 +1535,6 @@ elif nav == "⑤ 국가별 조회":
     ).reset_index()
     out = out.rename(columns={"p90_tmp": "리드타임 느린 상위10% 기준(P90)"})
 
-    # ✅ 출고건수 = 주문번호 distinct (거래처구분2별)
     tmp = base[[COL_CUST2, COL_ORDER_NO]].copy()
     tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_CUST2)["_ord"].nunique()
@@ -1852,11 +1543,10 @@ elif nav == "⑤ 국가별 조회":
     for c in ["평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준", "리드타임 느린 상위10% 기준(P90)"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
 
-    out["요청수량_합"] = pd.to_numeric(out["요청수량_합"], errors="coerce").fillna(0).round(0).astype(int)
-    out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype(int)
+    out["요청수량_합"] = pd.to_numeric(out["요청수량_합"], errors="coerce").fillna(0).round(0).astype("Int64")
+    out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype("Int64")
 
     out = out.sort_values("요청수량_합", ascending=False, na_position="last")
-
     render_pretty_table(out, height=520, wrap_cols=[COL_CUST2], number_cols=["요청수량_합", "출고건수", "집계행수_표본"])
     st.caption("※ P90은 ‘느린 상위 10%’ 경계값(리드타임이 큰 구간)입니다.")
 
@@ -1878,19 +1568,18 @@ elif nav == "⑥ BP명별 조회":
         집계행수_표본=(COL_BP, "size"),
     ).reset_index()
 
-    # ✅ 출고건수 = 주문번호 distinct (BP별)
     tmp = base[[COL_BP, COL_ORDER_NO]].copy()
     tmp["_ord"] = tmp[COL_ORDER_NO].astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     rep_cnt = tmp.dropna(subset=["_ord"]).groupby(COL_BP)["_ord"].nunique()
     out["출고건수"] = out[COL_BP].astype(str).map(rep_cnt).fillna(0).astype(int)
 
-    out["요청수량_합"] = pd.to_numeric(out["요청수량_합"], errors="coerce").fillna(0).round(0).astype(int)
+    out["요청수량_합"] = pd.to_numeric(out["요청수량_합"], errors="coerce").fillna(0).round(0).astype("Int64")
     for c in ["평균_리드타임_작업완료기준", "리드타임_중간값_작업완료기준"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
 
     out["최근_출고일"] = out["최근_출고일"].apply(fmt_date)
     out["최근_작업완료일"] = out["최근_작업완료일"].apply(fmt_date)
-    out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype(int)
+    out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype("Int64")
 
     out = out.sort_values("요청수량_합", ascending=False, na_position="last")
     render_pretty_table(out, height=520, wrap_cols=[COL_BP], number_cols=["요청수량_합", "출고건수", "집계행수_표본"])
