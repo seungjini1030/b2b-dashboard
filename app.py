@@ -20,6 +20,10 @@
 # ✅ 이번 에러 수정
 # - 주차 라벨의 2026.0년/3.0월 문제 제거(연/월을 Int64로 변환 후 문자열화)
 # - IntCastingNaNError 방지: astype(int) 최소화 + Int64(Nullable) 캐스팅/ fillna 보강
+#
+# ✅ 추가 수정 (요청사항)
+# - 상단 "데이터 새로고침" 클릭 시, 페이지는 ①로 이동하되
+#   st.radio의 선택(빨간점)도 ①로 확실히 초기화되도록 nav_menu를 강제 세팅
 # ==========================================
 
 import re
@@ -574,7 +578,6 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     bp_map = build_bp_list_map_for_items(cur_df, spike[[COL_ITEM_CODE, COL_ITEM_NAME]])
     spike = spike.merge(bp_map, on=[COL_ITEM_CODE, COL_ITEM_NAME], how="left")
 
-    # ✅ IntCastingNaNError 방지: Int64 사용
     spike["현재_요청수량"] = pd.to_numeric(spike["현재_요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
     spike["이전_요청수량"] = pd.to_numeric(spike["이전_요청수량"], errors="coerce").fillna(0).round(0).astype("Int64")
     spike["증가배수"] = pd.to_numeric(spike["증가배수"], errors="coerce").round(2)
@@ -621,7 +624,6 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
 
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
-    # ✅ 출고건수 = 주문번호 distinct
     if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
     return _clean_nunique(df[COL_ORDER_NO])
@@ -647,32 +649,6 @@ def _find_category_col(df: pd.DataFrame):
         if c in df.columns:
             return c
     return None
-
-
-def new_bp_comment(all_df: pd.DataFrame, cur_df: pd.DataFrame, key_col_num: str, cur_key_num, top_n: int = 5) -> list[str]:
-    if cur_df is None or cur_df.empty or COL_BP not in cur_df.columns:
-        return []
-
-    hist = all_df.copy()
-    if key_col_num in hist.columns and cur_key_num is not None:
-        hist_key = pd.to_numeric(hist[key_col_num], errors="coerce")
-        hist = hist[hist_key.notna() & (hist_key.astype(int) < int(cur_key_num))]
-
-    hist_bps = set(hist[COL_BP].dropna().astype(str).str.strip().tolist()) if (COL_BP in hist.columns and not hist.empty) else set()
-    cur_bps = set(cur_df[COL_BP].dropna().astype(str).str.strip().tolist())
-
-    new_bps = [bp for bp in cur_bps if bp and bp not in hist_bps]
-    if not new_bps:
-        return ["신규 출고 BP: 없음"]
-
-    sub = cur_df[cur_df[COL_BP].astype(str).str.strip().isin(new_bps)].copy()
-    if COL_QTY in sub.columns:
-        g = sub.groupby(COL_BP)[COL_QTY].sum().sort_values(ascending=False).head(top_n)
-        desc = ", ".join([f"{idx}({_fmt_int(val)})" for idx, val in g.items()])
-    else:
-        desc = ", ".join(new_bps[:top_n])
-
-    return [f"신규 출고 BP: {desc}"]
 
 
 def category_top_comment(cur_df: pd.DataFrame, top_n: int = 2) -> list[str]:
@@ -793,7 +769,6 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
     wk = ((base_dt.dt.day - 1) // 7 + 1).astype("Int64")
     mask = base_dt.notna() & wk.notna()
 
-    # ✅ (버그fix) dt.year/dt.month가 NaT 섞이면 float(2026.0)로 나오는 문제 방지
     y_int = base_dt.dt.year.astype("Int64")
     m_int = base_dt.dt.month.astype("Int64")
 
@@ -834,7 +809,6 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
             .reset_index()
             .rename(columns={COL_QTY: "qty_sum"})
         )
-        # ✅ 안전 캐스팅(Int64)
         cal_agg["qty_sum"] = pd.to_numeric(cal_agg["qty_sum"], errors="coerce").fillna(0).round(0).astype("Int64")
 
     return df, cal_agg
@@ -845,10 +819,7 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 # =========================
 def compute_kpis(df_view: pd.DataFrame):
     total_qty = float(pd.to_numeric(df_view[COL_QTY], errors="coerce").fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
-
-    # ✅ 출고건수 = 주문번호 distinct
     total_cnt = _clean_nunique(df_view[COL_ORDER_NO]) if (df_view is not None and not df_view.empty and COL_ORDER_NO in df_view.columns) else 0
-
     latest_done = df_view[COL_DONE].max() if (df_view is not None and COL_DONE in df_view.columns) else pd.NaT
 
     avg_lt2_overseas = None
@@ -1065,16 +1036,40 @@ def reset_state_for_menu(menu: str):
 
 
 # =========================
+# ✅ nav state init (추가)
+# =========================
+def init_nav_state():
+    # 브라우저가 이전 라디오 값을 다시 보내더라도,
+    # 서버에서 명시적으로 ①로 세팅하면 UI 선택점도 안정적으로 ①로 고정됨
+    st.session_state.setdefault("nav_menu", "① 출고 캘린더")
+    st.session_state.setdefault("_prev_nav_menu", st.session_state["nav_menu"])
+
+
+# =========================
 # Main
 # =========================
 st.title("📦 B2B 출고 대시보드")
 st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
 
+# ✅ 항상 nav state 기본값 보장
+init_nav_state()
+
+# =========================
+# ✅ Refresh handler (수정 핵심)
+# =========================
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
+
+    # 필요 state 정리
     for k in list(st.session_state.keys()):
-        if k.startswith(("cal_", "f_", "sku_", "wk_", "m_")) or k in ("nav_menu", "monthly_report_text", "_prev_nav_menu"):
+        if k.startswith(("cal_", "f_", "sku_", "wk_", "m_")) or k in ("monthly_report_text",):
             del st.session_state[k]
+
+    # ✅ 라디오 선택점(빨간점)까지 포함해서 ①로 강제 초기화
+    st.session_state["nav_menu"] = "① 출고 캘린더"
+    st.session_state["_prev_nav_menu"] = "① 출고 캘린더"
+    reset_state_for_menu("① 출고 캘린더")
+
     safe_rerun()
 
 with st.spinner("Google Sheet RAW 로딩/전처리 중..."):
