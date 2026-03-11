@@ -12,18 +12,18 @@
 #
 # ✅ UX 통일
 # - 메뉴(①~⑥) 이동 시: 각 메뉴는 항상 '메인 화면'으로 초기화
-#   (단, 왼쪽 필터 f_* 값은 유지)
+#   (단, 기존 버전에서는 왼쪽 필터 f_* 값은 유지였으나)
+#
+# ✅ (요청 반영) "데이터 새로고침" 정책
+# - 새로고침 클릭 시: 데이터/탭/화면/필터/내부상태 "모두 초기화"
+# - st.radio 선택(빨간점)도 ①로 강제 고정되도록 nav_menu를 명시 세팅
 #
 # ✅ 표기 개선
 # - 캘린더 상세: 작업완료가 단일 날짜면 "YYYY-MM-DD"로만 표시
 #
-# ✅ 이번 에러 수정
+# ✅ 에러 수정
 # - 주차 라벨의 2026.0년/3.0월 문제 제거(연/월을 Int64로 변환 후 문자열화)
 # - IntCastingNaNError 방지: astype(int) 최소화 + Int64(Nullable) 캐스팅/ fillna 보강
-#
-# ✅ 추가 수정 (요청사항)
-# - 상단 "데이터 새로고침" 클릭 시, 페이지는 ①로 이동하되
-#   st.radio의 선택(빨간점)도 ①로 확실히 초기화되도록 nav_menu를 강제 세팅
 # ==========================================
 
 import re
@@ -383,24 +383,8 @@ def parse_month_label_key(label: str) -> tuple[int, int]:
     return (y, m)
 
 
-def month_key_num_from_label(label: str):
-    y, m = parse_month_label_key(label)
-    if y <= 0 or m <= 0:
-        return None
-    return y * 100 + m
-
-
-def month_label_next(label: str):
-    y, m = parse_month_label_key(label)
-    if y <= 0 or m <= 0:
-        return None
-    if m == 12:
-        return make_month_label(y + 1, 1)
-    return make_month_label(y, m + 1)
-
-
 # =========================
-# SKU 자동 코멘트(원본 기능 유지)
+# SKU 자동 코멘트
 # =========================
 def _fmt_int(x) -> str:
     try:
@@ -489,7 +473,7 @@ def sku_comment_bp_spike(df_sku: pd.DataFrame, spike_factor=1.5, top_n=3) -> lis
 
 
 # =========================
-# TopN breakdown(대용량 최적화)
+# TopN breakdown (대용량 최적화)
 # =========================
 def build_bp_list_map_for_items(df_period: pd.DataFrame, items: pd.DataFrame) -> pd.DataFrame:
     if df_period.empty or items.empty:
@@ -624,6 +608,7 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
 
 
 def _get_ship_cnt(df: pd.DataFrame) -> int:
+    # ✅ 출고건수 = 주문번호 distinct
     if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
     return _clean_nunique(df[COL_ORDER_NO])
@@ -769,6 +754,7 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
     wk = ((base_dt.dt.day - 1) // 7 + 1).astype("Int64")
     mask = base_dt.notna() & wk.notna()
 
+    # ✅ dt.year/dt.month NaT 섞이면 float(2026.0) 되는 문제 방지
     y_int = base_dt.dt.year.astype("Int64")
     m_int = base_dt.dt.month.astype("Int64")
 
@@ -819,7 +805,10 @@ def load_prepared_from_gsheet() -> tuple[pd.DataFrame, pd.DataFrame]:
 # =========================
 def compute_kpis(df_view: pd.DataFrame):
     total_qty = float(pd.to_numeric(df_view[COL_QTY], errors="coerce").fillna(0).sum()) if (df_view is not None and COL_QTY in df_view.columns) else 0.0
+
+    # ✅ 출고건수 = 주문번호 distinct
     total_cnt = _clean_nunique(df_view[COL_ORDER_NO]) if (df_view is not None and not df_view.empty and COL_ORDER_NO in df_view.columns) else 0
+
     latest_done = df_view[COL_DONE].max() if (df_view is not None and COL_DONE in df_view.columns) else pd.NaT
 
     avg_lt2_overseas = None
@@ -1035,12 +1024,7 @@ def reset_state_for_menu(menu: str):
             del st.session_state["monthly_report_text"]
 
 
-# =========================
-# ✅ nav state init (추가)
-# =========================
 def init_nav_state():
-    # 브라우저가 이전 라디오 값을 다시 보내더라도,
-    # 서버에서 명시적으로 ①로 세팅하면 UI 선택점도 안정적으로 ①로 고정됨
     st.session_state.setdefault("nav_menu", "① 출고 캘린더")
     st.session_state.setdefault("_prev_nav_menu", st.session_state["nav_menu"])
 
@@ -1051,24 +1035,30 @@ def init_nav_state():
 st.title("📦 B2B 출고 대시보드")
 st.caption("Google Sheet RAW 기반 | 제품분류 B0/B1 고정 | 필터(거래처구분1/2/월/BP) 반영")
 
-# ✅ 항상 nav state 기본값 보장
+# ✅ nav 기본값 보장
 init_nav_state()
 
 # =========================
-# ✅ Refresh handler (수정 핵심)
+# ✅ Refresh handler (전부 초기화 정책)
 # =========================
 if st.button("🔄 데이터 새로고침"):
     st.cache_data.clear()
 
-    # 필요 state 정리
+    # 상태 정리(필터/캘린더/각 메뉴 내부 상태 등)
     for k in list(st.session_state.keys()):
         if k.startswith(("cal_", "f_", "sku_", "wk_", "m_")) or k in ("monthly_report_text",):
             del st.session_state[k]
 
-    # ✅ 라디오 선택점(빨간점)까지 포함해서 ①로 강제 초기화
+    # ✅ (핵심) 탭/화면 ①로 강제 초기화 (라디오 빨간점 포함)
     st.session_state["nav_menu"] = "① 출고 캘린더"
     st.session_state["_prev_nav_menu"] = "① 출고 캘린더"
     reset_state_for_menu("① 출고 캘린더")
+
+    # ✅ (요청 반영) 필터도 “무조건 전체”로 강제 초기화 4줄
+    st.session_state["f_cust1"] = "전체"
+    st.session_state["f_cust2"] = "전체"
+    st.session_state["f_month"] = "전체"
+    st.session_state["f_bp"] = "전체"
 
     safe_rerun()
 
@@ -1121,7 +1111,7 @@ with st.sidebar.form("filters_form", border=True):
         pool3 = pool3[pool3["_month_label"].astype(str) == str(sel_month_label)]
 
     bp_list = uniq_sorted(pool3, COL_BP)
-    sel_bp = safe_selectbox("BP명", ["전체"] + bp_list, key="f_bp")
+    _ = safe_selectbox("BP명", ["전체"] + bp_list, key="f_bp")
 
     st.form_submit_button("✅ 필터 적용", use_container_width=True)
 
