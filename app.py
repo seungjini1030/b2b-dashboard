@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 # =========================
 # 컬럼명 표준화 (RAW 기준)
 # =========================
@@ -850,6 +851,16 @@ def _overseas_stock_type_from_item_name(name: str) -> str:
     if re.search(pat, s, flags=re.IGNORECASE):
         return "전용재고"
     return "공용재고"
+def _extract_overseas_country(name: str) -> str:
+    """품목명에서 해외 출하 국가 코드 추출: JP / CN / EU / MO / 공용"""
+    s = (name or "").strip()
+    if not s:
+        return "공용"
+    m = re.search(r"\b(CN|EU|MO|JP|Mo)\b", s, flags=re.IGNORECASE)
+    if m:
+        code = m.group(1).upper()
+        return code if code != "MO" else "MO"
+    return "공용"
 def _new_bp_detail_lines_whole_history(
     all_df: pd.DataFrame,
     cur_df: pd.DataFrame,
@@ -1216,7 +1227,7 @@ st.divider()
 # =========================
 nav = st.radio(
     "메뉴",
-    ["① 출고 캘린더", "② SKU별 조회", "③ 주차요약", "④ 월간요약", "⑤ 국가별 조회", "⑥ BP명별 조회"],
+    ["① 출고 캘린더", "② SKU별 조회", "③ 주차요약", "④ 월간요약", "⑤ 국가별 조회", "⑥ BP명별 조회", "⑦ 트렌드 분석"],
     horizontal=True,
     key="nav_menu"
 )
@@ -1533,6 +1544,18 @@ elif nav == "② SKU별 조회":
             wrap_cols=["월"],
             number_cols=["요청수량_합"]
         )
+        # 월별 바 차트
+        if len(month_summary) > 1:
+            chart_ms = month_summary.copy()
+            chart_ms["요청수량_합"] = pd.to_numeric(chart_ms["요청수량_합"], errors="coerce").fillna(0)
+            fig_sku_m = px.bar(
+                chart_ms, x="월", y="요청수량_합",
+                title=f"{sel_code} 월별 요청수량 추이",
+                labels={"요청수량_합": "요청수량"},
+                color_discrete_sequence=["#3b82f6"],
+            )
+            fig_sku_m.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig_sku_m, use_container_width=True)
 
 # =========================
 # ③ 주차요약
@@ -1569,6 +1592,29 @@ elif nav == "③ 주차요약":
     render_numbered_block("주간 특이사항 (자동 코멘트)", comment_items)
     if prev_week:
         st.caption(f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week})")
+    # ── 최근 12주 출고 추이 바 차트 ──
+    st.divider()
+    st.subheader("📊 최근 12주 출고 추이")
+    wk_agg_src = d.copy()
+    wk_agg_src["_week_key_num"] = pd.to_numeric(wk_agg_src["_week_key_num"], errors="coerce")
+    wk_agg_src = wk_agg_src.dropna(subset=["_week_label", "_week_key_num"])
+    wk_agg = (
+        wk_agg_src.groupby(["_week_label", "_week_key_num"], dropna=False)[COL_QTY]
+        .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+    )
+    wk_agg["요청수량"] = pd.to_numeric(wk_agg["요청수량"], errors="coerce").fillna(0)
+    wk_agg = wk_agg.sort_values("_week_key_num").tail(12)
+    if not wk_agg.empty:
+        bar_colors = ["#ef4444" if lbl == sel_week else "#3b82f6" for lbl in wk_agg["_week_label"]]
+        fig_wk = px.bar(
+            wk_agg, x="_week_label", y="요청수량",
+            title="최근 12주 요청수량 추이 (빨간색: 선택 주차)",
+            labels={"_week_label": "주차", "요청수량": "요청수량"},
+        )
+        fig_wk.update_traces(marker_color=bar_colors)
+        fig_wk.update_layout(height=340, margin=dict(l=0, r=0, t=40, b=0),
+                              xaxis_tickangle=-30)
+        st.plotly_chart(fig_wk, use_container_width=True)
     st.divider()
     st.subheader("전주 대비 급증 SKU 리포트 (+30% 이상 증가)")
     if prev_week is None:
@@ -1621,6 +1667,31 @@ elif nav == "④ 월간요약":
     render_numbered_block("월간 특이사항 (자동 코멘트)", comment_items)
     if prev_month:
         st.caption(f"※ 비교 기준: 선택 월({sel_month}) vs 전월({prev_month})")
+    # ── 월별 누적 바 차트 (해외B2B / 국내B2B) ──
+    if "_ship_ym" in d.columns and COL_CUST1 in d.columns:
+        m_chart_src = d.dropna(subset=["_ship_ym"]).copy()
+        m_chart_src["_ship_ym"] = m_chart_src["_ship_ym"].astype(str).str.strip()
+        m_chart_src = m_chart_src[m_chart_src["_ship_ym"] != ""]
+        m_chart_data = (
+            m_chart_src.groupby(["_ship_ym", COL_CUST1], dropna=False)[COL_QTY]
+            .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+        )
+        m_chart_data = m_chart_data[m_chart_data[COL_CUST1].isin(["해외B2B", "국내B2B"])].copy()
+        m_chart_data["요청수량"] = pd.to_numeric(m_chart_data["요청수량"], errors="coerce").fillna(0)
+        m_chart_data = m_chart_data.sort_values("_ship_ym")
+        if not m_chart_data.empty:
+            fig_m = px.bar(
+                m_chart_data, x="_ship_ym", y="요청수량", color=COL_CUST1,
+                barmode="stack",
+                title="월별 출고수량 추이 (해외B2B / 국내B2B)",
+                labels={"_ship_ym": "월", "요청수량": "요청수량", COL_CUST1: "구분"},
+                color_discrete_map={"해외B2B": "#3b82f6", "국내B2B": "#10b981"},
+            )
+            fig_m.update_layout(
+                height=360, margin=dict(l=0, r=0, t=40, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
     st.markdown("### 📝 월간 리포트 생성")
     cbtn1, cbtn2 = st.columns([1.2, 1.0], vertical_alignment="center")
     with cbtn1:
@@ -1713,4 +1784,243 @@ elif nav == "⑥ BP명별 조회":
     out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype("Int64")
     out = out.sort_values("요청수량_합", ascending=False, na_position="last")
     render_pretty_table(out, height=520, wrap_cols=[COL_BP], number_cols=["요청수량_합", "출고건수", "집계행수_표본"])
+# =========================
+# ⑦ 트렌드 분석
+# =========================
+elif nav == "⑦ 트렌드 분석":
+    st.subheader("트렌드 분석")
+    st.caption("※ 트렌드 분석은 월 필터를 무시하고 전체 기간 기준으로 표시됩니다. (거래처구분1/2, BP 필터는 반영)")
+
+    # 트렌드용 베이스: 월 필터 제외, 나머지 필터 적용
+    trend_base = raw.copy()
+    if st.session_state["f_cust1"] != "전체":
+        trend_base = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == st.session_state["f_cust1"]]
+    if st.session_state["f_cust2"] != "전체":
+        trend_base = trend_base[trend_base[COL_CUST2].astype(str).str.strip() == st.session_state["f_cust2"]]
+    if st.session_state["f_bp"] != "전체":
+        trend_base = trend_base[trend_base[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
+
+    if trend_base.empty or "_ship_ym" not in trend_base.columns:
+        st.info("표시할 데이터가 없습니다.")
+        st.stop()
+
+    trend_base = trend_base.dropna(subset=["_ship_ym"]).copy()
+    trend_base["_ship_ym"] = trend_base["_ship_ym"].astype(str).str.strip()
+    trend_base = trend_base[trend_base["_ship_ym"] != ""]
+
+    TREND_TOP_N = 10
+    COLOR_OVERSEAS = "#3b82f6"
+    COLOR_DOMESTIC = "#10b981"
+    COUNTRY_COLORS = {"JP": "#f59e0b", "CN": "#ef4444", "EU": "#8b5cf6", "MO": "#ec4899", "공용": "#3b82f6"}
+
+    # ────────────────────────────────────────────
+    # 섹션 1 · 전체 월별 출고 추이
+    # ────────────────────────────────────────────
+    st.subheader("📈 섹션 1 · 전체 월별 출고 추이")
+    s1_data = (
+        trend_base.groupby(["_ship_ym", COL_CUST1], dropna=False)[COL_QTY]
+        .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+    )
+    s1_data = s1_data[s1_data[COL_CUST1].isin(["해외B2B", "국내B2B"])].copy()
+    s1_data["요청수량"] = pd.to_numeric(s1_data["요청수량"], errors="coerce").fillna(0)
+    s1_data = s1_data.sort_values("_ship_ym")
+    if s1_data.empty:
+        st.info("해외B2B / 국내B2B 데이터가 없습니다.")
+    else:
+        fig1 = px.bar(
+            s1_data, x="_ship_ym", y="요청수량", color=COL_CUST1,
+            barmode="stack",
+            title="월별 출고수량 추이 (해외B2B / 국내B2B)",
+            labels={"_ship_ym": "월", "요청수량": "요청수량", COL_CUST1: "구분"},
+            color_discrete_map={"해외B2B": COLOR_OVERSEAS, "국내B2B": COLOR_DOMESTIC},
+        )
+        fig1.update_layout(
+            height=400, margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # ────────────────────────────────────────────
+    # 섹션 2 · Top10 BP 월별 추이
+    # ────────────────────────────────────────────
+    st.divider()
+    st.subheader("🏢 섹션 2 · Top10 BP 월별 추이")
+    tab_s2_ovs, tab_s2_dom = st.tabs(["🟦 해외B2B", "🟩 국내B2B"])
+    for _tab2, _cust1_2 in [(tab_s2_ovs, "해외B2B"), (tab_s2_dom, "국내B2B")]:
+        with _tab2:
+            sub2 = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == _cust1_2].copy()
+            if sub2.empty:
+                st.info(f"{_cust1_2} 데이터가 없습니다.")
+                continue
+            top_bps2 = (
+                sub2.groupby(COL_BP, dropna=False)[COL_QTY].sum()
+                .sort_values(ascending=False).head(TREND_TOP_N).index.tolist()
+            )
+            s2_data = (
+                sub2[sub2[COL_BP].isin(top_bps2)]
+                .groupby(["_ship_ym", COL_BP], dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+            )
+            s2_data["요청수량"] = pd.to_numeric(s2_data["요청수량"], errors="coerce").fillna(0)
+            s2_data = s2_data.sort_values("_ship_ym")
+            if s2_data.empty:
+                st.info("데이터가 없습니다.")
+                continue
+            fig2 = px.line(
+                s2_data, x="_ship_ym", y="요청수량", color=COL_BP,
+                title=f"{_cust1_2} Top{TREND_TOP_N} BP 월별 요청수량 추이",
+                labels={"_ship_ym": "월", "요청수량": "요청수량", COL_BP: "BP명"},
+                markers=True,
+            )
+            fig2.update_layout(
+                height=440, margin=dict(l=0, r=0, t=40, b=0),
+                legend=dict(orientation="v", x=1.01, y=1),
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+            st.caption(f"※ 전체 기간 기준 요청수량 Top{TREND_TOP_N} BP")
+
+    # ────────────────────────────────────────────
+    # 섹션 3 · Top10 SKU 월별 추이
+    # ────────────────────────────────────────────
+    st.divider()
+    st.subheader("📦 섹션 3 · Top10 SKU 월별 추이")
+    tab_s3_ovs, tab_s3_dom = st.tabs(["🟦 해외B2B (JP/CN/EU/MO/공용 구분)", "🟩 국내B2B"])
+
+    with tab_s3_ovs:
+        sub3_o = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == "해외B2B"].copy()
+        if sub3_o.empty:
+            st.info("해외B2B 데이터가 없습니다.")
+        else:
+            sub3_o["__country"] = sub3_o[COL_ITEM_NAME].astype(str).apply(_extract_overseas_country)
+            top_skus_o = (
+                sub3_o.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum()
+                .sort_values(ascending=False).head(TREND_TOP_N).reset_index()
+            )
+            top_codes_o = top_skus_o[COL_ITEM_CODE].tolist()
+            sub3_o_top = sub3_o[sub3_o[COL_ITEM_CODE].isin(top_codes_o)].copy()
+            sku_label_o = (
+                sub3_o_top.drop_duplicates(subset=[COL_ITEM_CODE])
+                .assign(lbl=lambda x: x[COL_ITEM_CODE] + " [" + x["__country"] + "]")
+                .set_index(COL_ITEM_CODE)["lbl"].to_dict()
+            )
+            s3_o = (
+                sub3_o_top.groupby(["_ship_ym", COL_ITEM_CODE, "__country"], dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+            )
+            s3_o["요청수량"] = pd.to_numeric(s3_o["요청수량"], errors="coerce").fillna(0)
+            s3_o["SKU"] = s3_o[COL_ITEM_CODE].map(sku_label_o).fillna(s3_o[COL_ITEM_CODE])
+            s3_o = s3_o.sort_values("_ship_ym")
+            if not s3_o.empty:
+                fig3_o = px.bar(
+                    s3_o, x="_ship_ym", y="요청수량", color="__country",
+                    barmode="stack",
+                    title=f"해외B2B Top{TREND_TOP_N} SKU 월별 추이 (국가 구분)",
+                    labels={"_ship_ym": "월", "요청수량": "요청수량", "__country": "국가"},
+                    color_discrete_map=COUNTRY_COLORS,
+                    custom_data=["SKU"],
+                )
+                fig3_o.update_traces(
+                    hovertemplate="<b>%{customdata[0]}</b><br>월: %{x}<br>요청수량: %{y:,}<extra></extra>"
+                )
+                fig3_o.update_layout(height=440, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig3_o, use_container_width=True)
+                if st.checkbox(f"해외B2B SKU별 라인 추이 보기", key="chk_sku_line_ovs"):
+                    fig3_o2 = px.line(
+                        s3_o, x="_ship_ym", y="요청수량", color="SKU",
+                        title=f"해외B2B Top{TREND_TOP_N} SKU 라인 추이",
+                        labels={"_ship_ym": "월", "요청수량": "요청수량"},
+                        markers=True,
+                    )
+                    fig3_o2.update_layout(height=420, margin=dict(l=0, r=0, t=40, b=0))
+                    st.plotly_chart(fig3_o2, use_container_width=True)
+
+    with tab_s3_dom:
+        sub3_d = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == "국내B2B"].copy()
+        if sub3_d.empty:
+            st.info("국내B2B 데이터가 없습니다.")
+        else:
+            top_skus_d = (
+                sub3_d.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY].sum()
+                .sort_values(ascending=False).head(TREND_TOP_N).reset_index()
+            )
+            top_codes_d = top_skus_d[COL_ITEM_CODE].tolist()
+            sub3_d_top = sub3_d[sub3_d[COL_ITEM_CODE].isin(top_codes_d)].copy()
+            sku_label_d = (
+                sub3_d_top.drop_duplicates(subset=[COL_ITEM_CODE])
+                .assign(lbl=lambda x: x[COL_ITEM_CODE] + "  " + x[COL_ITEM_NAME].astype(str).str[:14])
+                .set_index(COL_ITEM_CODE)["lbl"].to_dict()
+            )
+            s3_d = (
+                sub3_d_top.groupby(["_ship_ym", COL_ITEM_CODE], dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index().rename(columns={COL_QTY: "요청수량"})
+            )
+            s3_d["요청수량"] = pd.to_numeric(s3_d["요청수량"], errors="coerce").fillna(0)
+            s3_d["SKU"] = s3_d[COL_ITEM_CODE].map(sku_label_d).fillna(s3_d[COL_ITEM_CODE])
+            s3_d = s3_d.sort_values("_ship_ym")
+            if not s3_d.empty:
+                fig3_d = px.bar(
+                    s3_d, x="_ship_ym", y="요청수량", color="SKU",
+                    barmode="stack",
+                    title=f"국내B2B Top{TREND_TOP_N} SKU 월별 추이",
+                    labels={"_ship_ym": "월", "요청수량": "요청수량"},
+                )
+                fig3_d.update_layout(height=440, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig3_d, use_container_width=True)
+                if st.checkbox("국내B2B SKU별 라인 추이 보기", key="chk_sku_line_dom"):
+                    fig3_d2 = px.line(
+                        s3_d, x="_ship_ym", y="요청수량", color="SKU",
+                        title=f"국내B2B Top{TREND_TOP_N} SKU 라인 추이",
+                        labels={"_ship_ym": "월", "요청수량": "요청수량"},
+                        markers=True,
+                    )
+                    fig3_d2.update_layout(height=420, margin=dict(l=0, r=0, t=40, b=0))
+                    st.plotly_chart(fig3_d2, use_container_width=True)
+
+    # ────────────────────────────────────────────
+    # 섹션 4 · Top3 BP 집중도 변화
+    # ────────────────────────────────────────────
+    st.divider()
+    st.subheader("🎯 섹션 4 · Top3 BP 집중도 변화")
+    st.caption("전체 기간 기준 Top3 BP가 월별 전체 출고수량에서 차지하는 비율(%) — 공급 집중 리스크 모니터링")
+    tab_s4_ovs, tab_s4_dom = st.tabs(["🟦 해외B2B", "🟩 국내B2B"])
+    for _tab4, _cust1_4 in [(tab_s4_ovs, "해외B2B"), (tab_s4_dom, "국내B2B")]:
+        with _tab4:
+            sub4 = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == _cust1_4].copy()
+            if sub4.empty:
+                st.info(f"{_cust1_4} 데이터가 없습니다.")
+                continue
+            top3_bps = (
+                sub4.groupby(COL_BP, dropna=False)[COL_QTY].sum()
+                .sort_values(ascending=False).head(3).index.tolist()
+            )
+            monthly_total4 = (
+                sub4.groupby("_ship_ym", dropna=False)[COL_QTY]
+                .sum().reset_index().rename(columns={COL_QTY: "total"})
+            )
+            monthly_total4["total"] = pd.to_numeric(monthly_total4["total"], errors="coerce").fillna(0)
+            s4_bp = (
+                sub4[sub4[COL_BP].isin(top3_bps)]
+                .groupby(["_ship_ym", COL_BP], dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index().rename(columns={COL_QTY: "bp_qty"})
+            )
+            s4_bp["bp_qty"] = pd.to_numeric(s4_bp["bp_qty"], errors="coerce").fillna(0)
+            s4_data = s4_bp.merge(monthly_total4, on="_ship_ym", how="left")
+            s4_data["비율(%)"] = (s4_data["bp_qty"] / s4_data["total"].replace(0, float("nan")) * 100).round(1)
+            s4_data = s4_data.sort_values("_ship_ym")
+            if s4_data.empty:
+                st.info("데이터가 없습니다.")
+                continue
+            fig4 = px.line(
+                s4_data, x="_ship_ym", y="비율(%)", color=COL_BP,
+                title=f"{_cust1_4} Top3 BP 집중도 변화 (%)",
+                labels={"_ship_ym": "월", "비율(%)": "비율(%)", COL_BP: "BP명"},
+                markers=True,
+            )
+            fig4.update_layout(
+                height=380, margin=dict(l=0, r=0, t=40, b=0),
+                yaxis=dict(ticksuffix="%", range=[0, 105]),
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+            st.caption(f"※ Top3 BP: {' / '.join(top3_bps)}")
+
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
