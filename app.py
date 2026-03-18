@@ -1330,6 +1330,18 @@ elif nav == "② SKU별 조회":
         else:
             cust1_map = None
 
+        # 출고일자 최초/최근 매핑
+        if COL_SHIP in bp_base.columns:
+            ship_g = (
+                bp_base.groupby(COL_BP, dropna=False)[COL_SHIP]
+                .agg(최초출고일="min", 최근출고일="max")
+                .reset_index()
+            )
+            ship_g["최초출고일"] = ship_g["최초출고일"].apply(fmt_date)
+            ship_g["최근출고일"] = ship_g["최근출고일"].apply(fmt_date)
+        else:
+            ship_g = None
+
         bp_summary = (
             bp_base.groupby(COL_BP, dropna=False)[COL_QTY]
             .sum(min_count=1)
@@ -1352,10 +1364,10 @@ elif nav == "② SKU별 조회":
 
         if cust1_map is not None:
             bp_summary = bp_summary.merge(cust1_map, on=COL_BP, how="left")
-            col_order = [COL_BP, "거래처구분1", "요청수량_합", "비율(%)"]
-        else:
-            col_order = [COL_BP, "요청수량_합", "비율(%)"]
+        if ship_g is not None:
+            bp_summary = bp_summary.merge(ship_g, on=COL_BP, how="left")
 
+        col_order = [COL_BP, "거래처구분1", "요청수량_합", "비율(%)", "최초출고일", "최근출고일"]
         bp_summary = bp_summary[[c for c in col_order if c in bp_summary.columns]]
 
         tbl_height = min(80 + len(bp_summary) * 44, 500)
@@ -1365,6 +1377,67 @@ elif nav == "② SKU별 조회":
             wrap_cols=[COL_BP, "거래처구분1"],
             number_cols=["요청수량_합", "비율(%)"]
         )
+
+        # ── 월별 × BP명 채널 출고 현황 (피벗) ──
+        if "_month_label" in sku_df.columns and "_month_key_num" in sku_df.columns:
+            st.divider()
+            st.subheader("📊 월별 채널(BP명) 출고 현황")
+            st.caption("각 셀: 해당 월 해당 BP의 요청수량 합계 / 합계 행 포함")
+
+            pivot_src = sku_df.copy()
+            pivot_src["_month_key_num"] = pd.to_numeric(pivot_src["_month_key_num"], errors="coerce")
+            pivot_src = pivot_src.dropna(subset=["_month_label", "_month_key_num"])
+
+            if pivot_src.empty:
+                st.info("월별 채널 데이터가 없습니다.")
+            else:
+                # 월 정렬 순서 확보
+                month_order = (
+                    pivot_src[["_month_label", "_month_key_num"]]
+                    .drop_duplicates()
+                    .sort_values("_month_key_num")["_month_label"]
+                    .tolist()
+                )
+                pivot_long = (
+                    pivot_src
+                    .groupby(["_month_label", COL_BP], dropna=False)[COL_QTY]
+                    .sum(min_count=1)
+                    .reset_index()
+                    .rename(columns={COL_QTY: "qty"})
+                )
+                pivot_long["qty"] = (
+                    pd.to_numeric(pivot_long["qty"], errors="coerce")
+                    .fillna(0).round(0).astype(int)
+                )
+                wide = pivot_long.pivot_table(
+                    index="_month_label",
+                    columns=COL_BP,
+                    values="qty",
+                    aggfunc="sum",
+                    fill_value=0,
+                ).reset_index()
+                wide.columns.name = None
+
+                # 월 정렬 적용
+                sort_map = {v: i for i, v in enumerate(month_order)}
+                wide["_sort"] = wide["_month_label"].map(sort_map)
+                wide = wide.sort_values("_sort").drop(columns=["_sort"])
+                wide = wide.rename(columns={"_month_label": "월"})
+
+                # 합계 행 추가
+                num_cols = [c for c in wide.columns if c != "월"]
+                total_row = {"월": "합계"}
+                for c in num_cols:
+                    total_row[c] = int(wide[c].sum())
+                wide = pd.concat([wide, pd.DataFrame([total_row])], ignore_index=True)
+
+                pivot_height = min(80 + len(wide) * 44, 520)
+                render_pretty_table(
+                    wide,
+                    height=pivot_height,
+                    wrap_cols=["월"],
+                    number_cols=num_cols,
+                )
 
     # ── 월별 요청수량 추이 ──
     if "_month_label" in sku_df.columns and "_month_key_num" in sku_df.columns:
