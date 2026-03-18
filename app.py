@@ -277,6 +277,72 @@ def render_pretty_table(
         """,
         unsafe_allow_html=True
     )
+def render_pivot_table(
+    df: pd.DataFrame,
+    height: int = 520,
+    first_col_width: int = 90,
+    data_col_width: int = 110,
+):
+    """피벗 테이블 전용 렌더러 — 열 너비 균일, 헤더 줄바꿈, 숫자 우정렬"""
+    if df is None or df.empty:
+        st.info("표시할 데이터가 없습니다.")
+        return
+    cols = list(df.columns)
+    # colgroup: 첫 열은 좁게, 나머지는 균일
+    cg_parts = [f'<col style="width:{first_col_width}px; min-width:{first_col_width}px;">']
+    cg_parts += [
+        f'<col style="width:{data_col_width}px; min-width:{data_col_width}px;">'
+        for _ in cols[1:]
+    ]
+    colgroup = "<colgroup>" + "".join(cg_parts) + "</colgroup>"
+    # 헤더: 데이터 열은 줄바꿈 허용
+    th_first = (
+        f'<th style="width:{first_col_width}px; min-width:{first_col_width}px;'
+        f' white-space:nowrap;">{_escape(cols[0])}</th>'
+    )
+    th_rest = "".join([
+        f'<th style="width:{data_col_width}px; min-width:{data_col_width}px;'
+        f' white-space:normal; word-break:break-all; text-align:center; line-height:1.3;">'
+        f'{_escape(c)}</th>'
+        for c in cols[1:]
+    ])
+    thead = f"<thead><tr>{th_first}{th_rest}</tr></thead>"
+    # 바디
+    tbody_rows = []
+    for _, row in df.iterrows():
+        tds = []
+        for i, c in enumerate(cols):
+            v = row[c]
+            if i == 0:
+                v_disp = "" if pd.isna(v) else str(v)
+                tds.append(f'<td style="white-space:nowrap; font-weight:500;">{_escape(v_disp)}</td>')
+            else:
+                v_disp = _fmt_num_for_table(v)
+                tds.append(
+                    f'<td class="mono" style="text-align:right; width:{data_col_width}px;">'
+                    f'{_escape(v_disp)}</td>'
+                )
+        tbody_rows.append("<tr>" + "".join(tds) + "</tr>")
+    tbody = "<tbody>" + "".join(tbody_rows) + "</tbody>"
+    total_width = first_col_width + data_col_width * (len(cols) - 1)
+    st.markdown(
+        f"""
+        <div class="pretty-table-wrap">
+          <div class="table-frame">
+            <div class="table-scroll" style="height:{int(height)}px; overflow-x:auto;">
+              <table class="pretty-table" style="table-layout:fixed; min-width:{total_width}px; width:100%;">
+                {colgroup}
+                {thead}
+                {tbody}
+              </table>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_numbered_block(title: str, items: list[str]):
     if not items:
         return
@@ -1319,31 +1385,16 @@ elif nav == "② SKU별 조회":
     else:
         bp_base = sku_df.copy()
 
-        # 거래처구분1 최빈값 매핑
-        if COL_CUST1 in bp_base.columns:
-            cust1_map = (
-                bp_base.groupby(COL_BP, dropna=False)[COL_CUST1]
-                .agg(lambda s: s.dropna().mode().iloc[0] if not s.dropna().empty else "")
-                .reset_index()
-                .rename(columns={COL_CUST1: "거래처구분1"})
-            )
-        else:
-            cust1_map = None
+        # 출고일자 + BP명 단위로 집계 (출고일자 오름차순)
+        has_ship = COL_SHIP in bp_base.columns and "_ship_date" in bp_base.columns
 
-        # 출고일자 최초/최근 매핑
-        if COL_SHIP in bp_base.columns:
-            ship_g = (
-                bp_base.groupby(COL_BP, dropna=False)[COL_SHIP]
-                .agg(최초출고일="min", 최근출고일="max")
-                .reset_index()
-            )
-            ship_g["최초출고일"] = ship_g["최초출고일"].apply(fmt_date)
-            ship_g["최근출고일"] = ship_g["최근출고일"].apply(fmt_date)
+        if has_ship:
+            grp_cols = ["_ship_date", COL_BP]
         else:
-            ship_g = None
+            grp_cols = [COL_BP]
 
         bp_summary = (
-            bp_base.groupby(COL_BP, dropna=False)[COL_QTY]
+            bp_base.groupby(grp_cols, dropna=False)[COL_QTY]
             .sum(min_count=1)
             .reset_index()
             .rename(columns={COL_QTY: "요청수량_합"})
@@ -1352,8 +1403,28 @@ elif nav == "② SKU별 조회":
             pd.to_numeric(bp_summary["요청수량_합"], errors="coerce")
             .fillna(0).round(0).astype("Int64")
         )
-        bp_summary = bp_summary.sort_values("요청수량_합", ascending=False, na_position="last")
 
+        # 출고일자 문자열 변환 및 오름차순 정렬
+        if has_ship:
+            bp_summary["출고일자"] = bp_summary["_ship_date"].apply(
+                lambda x: str(x) if pd.notna(x) else ""
+            )
+            bp_summary = bp_summary.drop(columns=["_ship_date"])
+            bp_summary = bp_summary.sort_values(["출고일자", COL_BP], ascending=True)
+        else:
+            bp_summary = bp_summary.sort_values(COL_BP)
+
+        # 거래처구분1 최빈값 매핑
+        if COL_CUST1 in bp_base.columns:
+            cust1_map = (
+                bp_base.groupby(COL_BP, dropna=False)[COL_CUST1]
+                .agg(lambda s: s.dropna().mode().iloc[0] if not s.dropna().empty else "")
+                .reset_index()
+                .rename(columns={COL_CUST1: "거래처구분1"})
+            )
+            bp_summary = bp_summary.merge(cust1_map, on=COL_BP, how="left")
+
+        # 전체 대비 비율
         total_bp_qty = float(bp_summary["요청수량_합"].sum())
         if total_bp_qty > 0:
             bp_summary["비율(%)"] = (
@@ -1362,15 +1433,10 @@ elif nav == "② SKU별 조회":
         else:
             bp_summary["비율(%)"] = 0.0
 
-        if cust1_map is not None:
-            bp_summary = bp_summary.merge(cust1_map, on=COL_BP, how="left")
-        if ship_g is not None:
-            bp_summary = bp_summary.merge(ship_g, on=COL_BP, how="left")
-
-        col_order = [COL_BP, "거래처구분1", "요청수량_합", "비율(%)", "최초출고일", "최근출고일"]
+        col_order = ["출고일자", COL_BP, "거래처구분1", "요청수량_합", "비율(%)"]
         bp_summary = bp_summary[[c for c in col_order if c in bp_summary.columns]]
 
-        tbl_height = min(80 + len(bp_summary) * 44, 500)
+        tbl_height = min(80 + len(bp_summary) * 44, 520)
         render_pretty_table(
             bp_summary,
             height=tbl_height,
@@ -1379,28 +1445,22 @@ elif nav == "② SKU별 조회":
         )
 
         # ── 월별 × BP명 채널 출고 현황 (피벗) ──
-        if "_month_label" in sku_df.columns and "_month_key_num" in sku_df.columns:
+        if "_ship_ym" in sku_df.columns:
             st.divider()
             st.subheader("📊 월별 채널(BP명) 출고 현황")
-            st.caption("각 셀: 해당 월 해당 BP의 요청수량 합계 / 합계 행 포함")
+            st.caption("각 셀: 해당 월·해당 BP의 요청수량 합계 / 마지막 행: 합계")
 
-            pivot_src = sku_df.copy()
-            pivot_src["_month_key_num"] = pd.to_numeric(pivot_src["_month_key_num"], errors="coerce")
-            pivot_src = pivot_src.dropna(subset=["_month_label", "_month_key_num"])
+            pivot_src = sku_df.dropna(subset=["_ship_ym"]).copy()
+            pivot_src["_ship_ym"] = pivot_src["_ship_ym"].astype(str).str.strip()
+            pivot_src = pivot_src[pivot_src["_ship_ym"] != ""]
 
             if pivot_src.empty:
                 st.info("월별 채널 데이터가 없습니다.")
             else:
-                # 월 정렬 순서 확보
-                month_order = (
-                    pivot_src[["_month_label", "_month_key_num"]]
-                    .drop_duplicates()
-                    .sort_values("_month_key_num")["_month_label"]
-                    .tolist()
-                )
+                # _ship_ym 은 이미 "YYYY-MM" 형식 → 정렬만 하면 됨
                 pivot_long = (
                     pivot_src
-                    .groupby(["_month_label", COL_BP], dropna=False)[COL_QTY]
+                    .groupby(["_ship_ym", COL_BP], dropna=False)[COL_QTY]
                     .sum(min_count=1)
                     .reset_index()
                     .rename(columns={COL_QTY: "qty"})
@@ -1410,7 +1470,7 @@ elif nav == "② SKU별 조회":
                     .fillna(0).round(0).astype(int)
                 )
                 wide = pivot_long.pivot_table(
-                    index="_month_label",
+                    index="_ship_ym",
                     columns=COL_BP,
                     values="qty",
                     aggfunc="sum",
@@ -1418,11 +1478,9 @@ elif nav == "② SKU별 조회":
                 ).reset_index()
                 wide.columns.name = None
 
-                # 월 정렬 적용
-                sort_map = {v: i for i, v in enumerate(month_order)}
-                wide["_sort"] = wide["_month_label"].map(sort_map)
-                wide = wide.sort_values("_sort").drop(columns=["_sort"])
-                wide = wide.rename(columns={"_month_label": "월"})
+                # YYYY-MM 오름차순 정렬 후 컬럼명 변경
+                wide = wide.sort_values("_ship_ym").reset_index(drop=True)
+                wide = wide.rename(columns={"_ship_ym": "월"})
 
                 # 합계 행 추가
                 num_cols = [c for c in wide.columns if c != "월"]
@@ -1432,11 +1490,11 @@ elif nav == "② SKU별 조회":
                 wide = pd.concat([wide, pd.DataFrame([total_row])], ignore_index=True)
 
                 pivot_height = min(80 + len(wide) * 44, 520)
-                render_pretty_table(
+                render_pivot_table(
                     wide,
                     height=pivot_height,
-                    wrap_cols=["월"],
-                    number_cols=num_cols,
+                    first_col_width=80,
+                    data_col_width=115,
                 )
 
     # ── 월별 요청수량 추이 ──
