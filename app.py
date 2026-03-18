@@ -27,7 +27,12 @@ from typing import Optional
 import numpy as np
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+try:
+    import plotly.express as px
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+    st.warning("plotly 패키지가 없습니다. requirements.txt에 plotly를 추가해 주세요.", icon="⚠️")
 # =========================
 # 컬럼명 표준화 (RAW 기준)
 # =========================
