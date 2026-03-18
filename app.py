@@ -1410,7 +1410,7 @@ elif nav == "② SKU별 조회":
                 lambda x: str(x) if pd.notna(x) else ""
             )
             bp_summary = bp_summary.drop(columns=["_ship_date"])
-            bp_summary = bp_summary.sort_values(["출고일자", COL_BP], ascending=True)
+            bp_summary = bp_summary.sort_values(["출고일자", COL_BP], ascending=[False, True])
         else:
             bp_summary = bp_summary.sort_values(COL_BP)
 
