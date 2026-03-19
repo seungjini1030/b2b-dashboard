@@ -1685,16 +1685,17 @@ elif nav == "④ 월간요약":
         m_chart_data["요청수량"] = pd.to_numeric(m_chart_data["요청수량"], errors="coerce").fillna(0)
         m_chart_data = m_chart_data.sort_values("_ship_ym")
         if not m_chart_data.empty:
+            st.subheader("📊 월별 출고수량 추이 (해외B2B / 국내B2B)")
             fig_m = px.bar(
                 m_chart_data, x="_ship_ym", y="요청수량", color=COL_CUST1,
                 barmode="stack",
-                title="월별 출고수량 추이 (해외B2B / 국내B2B)",
                 labels={"_ship_ym": "월", "요청수량": "요청수량", COL_CUST1: "구분"},
                 color_discrete_map={"해외B2B": "#3b82f6", "국내B2B": "#10b981"},
             )
             fig_m.update_layout(
-                height=360, margin=dict(l=0, r=0, t=40, b=0),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                height=380, margin=dict(l=0, r=0, t=20, b=80),
+                legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+                xaxis=dict(type="category"),
             )
             st.plotly_chart(fig_m, use_container_width=True)
     st.markdown("### 📝 월간 리포트 생성")
@@ -1832,16 +1833,17 @@ elif nav == "⑦ 트렌드 분석":
     if s1_data.empty:
         st.info("해외B2B / 국내B2B 데이터가 없습니다.")
     else:
+        st.caption("월별 출고수량 추이 (해외B2B / 국내B2B)")
         fig1 = px.bar(
             s1_data, x="_ship_ym", y="요청수량", color=COL_CUST1,
             barmode="stack",
-            title="월별 출고수량 추이 (해외B2B / 국내B2B)",
             labels={"_ship_ym": "월", "요청수량": "요청수량", COL_CUST1: "구분"},
             color_discrete_map={"해외B2B": COLOR_OVERSEAS, "국내B2B": COLOR_DOMESTIC},
         )
         fig1.update_layout(
-            height=400, margin=dict(l=0, r=0, t=40, b=0),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            height=420, margin=dict(l=0, r=0, t=20, b=80),
+            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+            xaxis=dict(type="category"),
         )
         st.plotly_chart(fig1, use_container_width=True)
 
@@ -1871,15 +1873,16 @@ elif nav == "⑦ 트렌드 분석":
             if s2_data.empty:
                 st.info("데이터가 없습니다.")
                 continue
+            st.caption(f"{_cust1_2} Top{TREND_TOP_N} BP 월별 요청수량 추이")
             fig2 = px.line(
                 s2_data, x="_ship_ym", y="요청수량", color=COL_BP,
-                title=f"{_cust1_2} Top{TREND_TOP_N} BP 월별 요청수량 추이",
                 labels={"_ship_ym": "월", "요청수량": "요청수량", COL_BP: "BP명"},
                 markers=True,
             )
             fig2.update_layout(
-                height=440, margin=dict(l=0, r=0, t=40, b=0),
-                legend=dict(orientation="v", x=1.01, y=1),
+                height=460, margin=dict(l=0, r=0, t=20, b=100),
+                legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                xaxis=dict(type="category"),
             )
             st.plotly_chart(fig2, use_container_width=True)
             st.caption(f"※ 전체 기간 기준 요청수량 Top{TREND_TOP_N} BP")
@@ -1916,10 +1919,10 @@ elif nav == "⑦ 트렌드 분석":
             s3_o["SKU"] = s3_o[COL_ITEM_CODE].map(sku_label_o).fillna(s3_o[COL_ITEM_CODE])
             s3_o = s3_o.sort_values("_ship_ym")
             if not s3_o.empty:
+                st.caption(f"해외B2B Top{TREND_TOP_N} SKU 월별 추이 (국가 구분)")
                 fig3_o = px.bar(
                     s3_o, x="_ship_ym", y="요청수량", color="__country",
                     barmode="stack",
-                    title=f"해외B2B Top{TREND_TOP_N} SKU 월별 추이 (국가 구분)",
                     labels={"_ship_ym": "월", "요청수량": "요청수량", "__country": "국가"},
                     color_discrete_map=COUNTRY_COLORS,
                     custom_data=["SKU"],
@@ -1927,16 +1930,24 @@ elif nav == "⑦ 트렌드 분석":
                 fig3_o.update_traces(
                     hovertemplate="<b>%{customdata[0]}</b><br>월: %{x}<br>요청수량: %{y:,}<extra></extra>"
                 )
-                fig3_o.update_layout(height=440, margin=dict(l=0, r=0, t=40, b=0))
+                fig3_o.update_layout(
+                    height=460, margin=dict(l=0, r=0, t=20, b=80),
+                    legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+                    xaxis=dict(type="category"),
+                )
                 st.plotly_chart(fig3_o, use_container_width=True)
                 if st.checkbox(f"해외B2B SKU별 라인 추이 보기", key="chk_sku_line_ovs"):
+                    st.caption(f"해외B2B Top{TREND_TOP_N} SKU 라인 추이")
                     fig3_o2 = px.line(
                         s3_o, x="_ship_ym", y="요청수량", color="SKU",
-                        title=f"해외B2B Top{TREND_TOP_N} SKU 라인 추이",
                         labels={"_ship_ym": "월", "요청수량": "요청수량"},
                         markers=True,
                     )
-                    fig3_o2.update_layout(height=420, margin=dict(l=0, r=0, t=40, b=0))
+                    fig3_o2.update_layout(
+                        height=440, margin=dict(l=0, r=0, t=20, b=100),
+                        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                        xaxis=dict(type="category"),
+                    )
                     st.plotly_chart(fig3_o2, use_container_width=True)
 
     with tab_s3_dom:
@@ -1963,22 +1974,30 @@ elif nav == "⑦ 트렌드 분석":
             s3_d["SKU"] = s3_d[COL_ITEM_CODE].map(sku_label_d).fillna(s3_d[COL_ITEM_CODE])
             s3_d = s3_d.sort_values("_ship_ym")
             if not s3_d.empty:
+                st.caption(f"국내B2B Top{TREND_TOP_N} SKU 월별 추이")
                 fig3_d = px.bar(
                     s3_d, x="_ship_ym", y="요청수량", color="SKU",
                     barmode="stack",
-                    title=f"국내B2B Top{TREND_TOP_N} SKU 월별 추이",
                     labels={"_ship_ym": "월", "요청수량": "요청수량"},
                 )
-                fig3_d.update_layout(height=440, margin=dict(l=0, r=0, t=40, b=0))
+                fig3_d.update_layout(
+                    height=460, margin=dict(l=0, r=0, t=20, b=100),
+                    legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                    xaxis=dict(type="category"),
+                )
                 st.plotly_chart(fig3_d, use_container_width=True)
                 if st.checkbox("국내B2B SKU별 라인 추이 보기", key="chk_sku_line_dom"):
+                    st.caption(f"국내B2B Top{TREND_TOP_N} SKU 라인 추이")
                     fig3_d2 = px.line(
                         s3_d, x="_ship_ym", y="요청수량", color="SKU",
-                        title=f"국내B2B Top{TREND_TOP_N} SKU 라인 추이",
                         labels={"_ship_ym": "월", "요청수량": "요청수량"},
                         markers=True,
                     )
-                    fig3_d2.update_layout(height=420, margin=dict(l=0, r=0, t=40, b=0))
+                    fig3_d2.update_layout(
+                        height=440, margin=dict(l=0, r=0, t=20, b=100),
+                        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                        xaxis=dict(type="category"),
+                    )
                     st.plotly_chart(fig3_d2, use_container_width=True)
 
     # ────────────────────────────────────────────
@@ -2015,15 +2034,17 @@ elif nav == "⑦ 트렌드 분석":
             if s4_data.empty:
                 st.info("데이터가 없습니다.")
                 continue
+            st.caption(f"{_cust1_4} Top3 BP 집중도 변화 (%)")
             fig4 = px.line(
                 s4_data, x="_ship_ym", y="비율(%)", color=COL_BP,
-                title=f"{_cust1_4} Top3 BP 집중도 변화 (%)",
                 labels={"_ship_ym": "월", "비율(%)": "비율(%)", COL_BP: "BP명"},
                 markers=True,
             )
             fig4.update_layout(
-                height=380, margin=dict(l=0, r=0, t=40, b=0),
+                height=400, margin=dict(l=0, r=0, t=20, b=80),
                 yaxis=dict(ticksuffix="%", range=[0, 105]),
+                legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+                xaxis=dict(type="category"),
             )
             st.plotly_chart(fig4, use_container_width=True)
             st.caption(f"※ Top3 BP: {' / '.join(top3_bps)}")
