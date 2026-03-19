@@ -1489,7 +1489,8 @@ elif nav == "② SKU별 조회":
     sel_name_series = sku_df[COL_ITEM_NAME].dropna() if COL_ITEM_NAME in sku_df.columns else pd.Series([], dtype=str)
     sel_name = str(sel_name_series.iloc[0]) if not sel_name_series.empty else "-"
     total_qty = int(round(float(pd.to_numeric(sku_df[COL_QTY], errors="coerce").fillna(0).sum()), 0))
-    row_cnt = len(sku_df)
+    # 주문번호 기준 중복 제외 건수
+    order_cnt = _clean_nunique(sku_df[COL_ORDER_NO]) if COL_ORDER_NO in sku_df.columns else 0
 
     # ── KPI 카드 ──
     st.markdown(
@@ -1508,8 +1509,8 @@ elif nav == "② SKU별 조회":
             <div class="kpi-big">{total_qty:,}</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-title">RAW 데이터 행수</div>
-            <div class="kpi-value">{row_cnt:,}건</div>
+            <div class="kpi-title">출고건수 <span style="color:#6b7280;font-size:0.82rem;">(주문번호 distinct)</span></div>
+            <div class="kpi-value">{order_cnt:,}건</div>
           </div>
         </div>
         """,
