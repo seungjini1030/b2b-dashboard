@@ -812,6 +812,119 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
                             st.session_state["cal_expanded"] = expanded
                             safe_rerun()
 # =========================
+# Calendar detail view
+# =========================
+def render_calendar_detail(raw_df: pd.DataFrame, selected_date, selected_bp: str):
+    """캘린더 상세 화면 — 선택 날짜 × BP의 품목코드/품목명/요청수량/출고일자 표시"""
+    # 뒤로가기 버튼
+    if st.button("◀ 캘린더로 돌아가기", key="cal_detail_back", type="secondary"):
+        st.session_state["cal_view"] = "calendar"
+        safe_rerun()
+
+    st.subheader(f"📋 출고 상세 내역")
+    st.caption(f"출고일자: {selected_date}  |  BP명: {selected_bp}")
+
+    if raw_df is None or raw_df.empty:
+        st.info("데이터가 없습니다.")
+        return
+
+    if not all(c in raw_df.columns for c in [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY]):
+        st.warning("품목코드/품목명/요청수량 컬럼이 없습니다.")
+        return
+
+    # ── 날짜 + BP 필터 ──
+    detail_df = raw_df.copy()
+
+    if "_ship_date" in detail_df.columns:
+        detail_df = detail_df[detail_df["_ship_date"] == selected_date].copy()
+    elif COL_SHIP in detail_df.columns:
+        detail_df = detail_df[
+            pd.to_datetime(detail_df[COL_SHIP], errors="coerce").dt.date == selected_date
+        ].copy()
+
+    if COL_BP in detail_df.columns:
+        detail_df = detail_df[
+            detail_df[COL_BP].astype(str).str.strip() == str(selected_bp).strip()
+        ].copy()
+
+    if detail_df.empty:
+        st.info("해당 날짜/BP의 상세 데이터가 없습니다.")
+        return
+
+    # ── KPI 카드 ──
+    total_qty = int(pd.to_numeric(detail_df[COL_QTY], errors="coerce").fillna(0).sum())
+    row_cnt = len(detail_df)
+    cust1_val = ""
+    if COL_CUST1 in detail_df.columns:
+        mode_s = detail_df[COL_CUST1].dropna().astype(str).str.strip()
+        if not mode_s.empty:
+            cust1_val = mode_s.mode().iloc[0]
+
+    st.markdown(
+        f"""
+        <div class="kpi-wrap">
+          <div class="kpi-card">
+            <div class="kpi-title">출고일자</div>
+            <div class="kpi-value">{html.escape(str(selected_date))}</div>
+          </div>
+          <div class="kpi-card" style="flex: 2 1 220px;">
+            <div class="kpi-title">BP명</div>
+            <div class="kpi-value" style="word-break:break-word;">{html.escape(str(selected_bp))}</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">거래처구분</div>
+            <div class="kpi-value">{html.escape(cust1_val) if cust1_val else "-"}</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">총 요청수량</div>
+            <div class="kpi-big">{total_qty:,}</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">RAW 행수</div>
+            <div class="kpi-value">{row_cnt:,}건</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    # ── 표시 컬럼 구성 ──
+    out_df = detail_df.copy()
+
+    # 출고일자 문자열화
+    if COL_SHIP in out_df.columns:
+        out_df["출고일자"] = out_df[COL_SHIP].apply(fmt_date)
+        out_df = out_df.drop(columns=[COL_SHIP])
+    elif "_ship_date" in out_df.columns:
+        out_df["출고일자"] = out_df["_ship_date"].apply(
+            lambda x: str(x) if pd.notna(x) else "-"
+        )
+
+    # 요청수량 정수화
+    if COL_QTY in out_df.columns:
+        out_df[COL_QTY] = (
+            pd.to_numeric(out_df[COL_QTY], errors="coerce")
+            .fillna(0).round(0).astype("Int64")
+        )
+
+    # 출력 컬럼 순서: 품목코드 / 품목명 / 요청수량 / 출고일자
+    col_order = [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY, "출고일자"]
+    out_df = out_df[[c for c in col_order if c in out_df.columns]]
+
+    # 출고일자 → 정렬
+    if "출고일자" in out_df.columns:
+        out_df = out_df.sort_values("출고일자", ascending=True)
+
+    tbl_h = min(80 + len(out_df) * 44, 600)
+    render_pretty_table(
+        out_df,
+        height=tbl_h,
+        wrap_cols=[COL_ITEM_NAME],
+        number_cols=[COL_QTY],
+    )
+
+# =========================
 # 메뉴 UX 통일: 메뉴별 state reset
 # =========================
 def reset_state_for_menu(menu: str):
@@ -1258,8 +1371,20 @@ if nav == "① 출고 캘린더":
         else:
             st.session_state["cal_ym"] = date.today().strftime("%Y-%m")
     ym = st.session_state["cal_ym"]
-    st.subheader("출고 캘린더 (월별)")
-    render_month_calendar(cal_pool, ym)
+
+    # ── 뷰 분기: calendar ↔ detail ──
+    if st.session_state.get("cal_view") == "detail":
+        sel_date = st.session_state.get("cal_selected_date")
+        sel_bp   = st.session_state.get("cal_selected_bp", "")
+        if sel_date is None or not sel_bp:
+            # 상태 이상 → 캘린더로 복귀
+            st.session_state["cal_view"] = "calendar"
+            safe_rerun()
+        else:
+            render_calendar_detail(raw, sel_date, sel_bp)
+    else:
+        st.subheader("출고 캘린더 (월별)")
+        render_month_calendar(cal_pool, ym)
 # =========================
 # ② SKU별 조회
 # =========================
