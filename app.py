@@ -17,6 +17,13 @@
 # - 출고처(BP명)별 요청수량 합계 + 비율 테이블
 # - 월별 요청수량 추이 테이블
 # - 월 필터 무시 옵션(전체 기간 조회)
+#
+# ✅ v2.1 수정사항
+# - 이모지: Slack shortcode(:white_check_mark: 등) → 유니코드 이모지(✅ 등) 변환
+# - 버그수정: ③주차요약 / ④월간요약 — 사이드바 월 필터 적용 시
+#   전주/전월 비교 불가 버그 → pool2(월 필터 전) 기준으로 변경
+# - 리포트 직관성: 구매물류팀 관점 총괄 요약 섹션 추가,
+#   해외/국내 비율, 증감 방향 표시 강화
 # ==========================================
 import re
 import html
@@ -1147,6 +1154,18 @@ def _spike_sku_lines(cur_df: pd.DataFrame, prev_df: pd.DataFrame, top_n: int = R
         tail = f" → {bp_map}" if bp_map else ""
         out.append(f"- {code} {name} : {_fmt_int(prev_q)} → {_fmt_int(cur_q)} {pct_s}{tail}")
     return out
+
+
+# ✅ v2.1 — 증감 방향 표시 헬퍼
+def _pct_change_str(cur_val: float, prev_val: float) -> str:
+    """전월 대비 증감률 문자열 생성 (▲/▼ 포함)"""
+    if prev_val <= 0:
+        return "(전월 데이터 부족)"
+    pct = (cur_val / prev_val - 1) * 100
+    arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "→")
+    return f"({arrow} {abs(pct):.1f}%)"
+
+
 def build_monthly_share_report(
     all_df: pd.DataFrame,
     sel_month_label: str,
@@ -1154,16 +1173,49 @@ def build_monthly_share_report(
     prev_df: pd.DataFrame,
     next_df: Optional[pd.DataFrame] = None,
 ) -> str:
+    # ✅ v2.1 — 유니코드 이모지 사용 + 총괄 요약 추가
+
+    # ── 총괄 수치 산출 ──
+    total_cur_qty = _sum_qty(cur_df)
+    total_prev_qty = _sum_qty(prev_df)
+    overseas_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == "해외B2B"] if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
+    domestic_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == "국내B2B"] if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
+    overseas_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == "해외B2B"] if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
+    domestic_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == "국내B2B"] if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
+
+    ovs_cur_qty = _sum_qty(overseas_cur)
+    ovs_prev_qty = _sum_qty(overseas_prev)
+    dom_cur_qty = _sum_qty(domestic_cur)
+    dom_prev_qty = _sum_qty(domestic_prev)
+
+    # 비율
+    ovs_pct = (ovs_cur_qty / total_cur_qty * 100) if total_cur_qty > 0 else 0
+    dom_pct = (dom_cur_qty / total_cur_qty * 100) if total_cur_qty > 0 else 0
+
     head = [
-        f"{sel_month_label} B2B 현황 공유 드립니다.:blush: (SAP현황에 따라 자료는 오차 범위가 있을 수 있습니다!)",
+        f"📦 {sel_month_label} B2B 출고 현황 공유드립니다 😊",
+        "(SAP 현황 기준이며, 자료에 오차 범위가 있을 수 있습니다)",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 총괄 요약",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"- 총 출고수량: {_fmt_int(total_cur_qty)}개 {_pct_change_str(total_cur_qty, total_prev_qty)}",
+        f"  ├ 해외B2B: {_fmt_int(ovs_cur_qty)}개 ({ovs_pct:.0f}%) {_pct_change_str(ovs_cur_qty, ovs_prev_qty)}",
+        f"  └ 국내B2B: {_fmt_int(dom_cur_qty)}개 ({dom_pct:.0f}%) {_pct_change_str(dom_cur_qty, dom_prev_qty)}",
         "",
     ]
+
     def section_for(cust1_value: str, title: str, sched_top_bp_n: int):
         sub_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy()
         sub_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy() if (prev_df is not None) else pd.DataFrame()
         lines: list[str] = []
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"*{title}*")
-        lines.append(":white_check_mark: 신규 업체 첫 출고")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+
+        # 1) 신규 업체
+        lines.append("✅ 신규 업체 첫 출고")
         lines.extend(_new_bp_detail_lines_whole_history(
             all_df=all_df,
             cur_df=cur_df,
@@ -1172,36 +1224,48 @@ def build_monthly_share_report(
             top_n=REPORT_TOP_N
         ))
         lines.append("")
+
+        # 2) 출고량 증감 요약
         cq = _sum_qty(sub_cur)
         pq = _sum_qty(sub_prev)
         diff = cq - pq
-        lines.append(":white_check_mark: 출고량 증감 요약")
+        lines.append("✅ 출고량 증감 요약")
         if pq > 0:
-            lines.append(f"- 출고수량 전월 대비 {diff:+,}개({_fmt_int(pq)} → {_fmt_int(cq)})")
+            pct = (cq / pq - 1) * 100
+            arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "→")
+            lines.append(f"- 출고수량: {_fmt_int(pq)} → {_fmt_int(cq)}개 ({arrow} {abs(diff):,}개, {abs(pct):.1f}%)")
         else:
-            lines.append(f"- 출고수량: {_fmt_int(cq)}개 (전월 데이터 0/부족으로 증감 산정 불가)")
+            lines.append(f"- 출고수량: {_fmt_int(cq)}개 (전월 데이터 부족으로 증감 산정 불가)")
         top_bps = _top_bp_lines(sub_cur, top_n=REPORT_TOP_N)
         lines.append("- 주요 출고 업체 : " + (" / ".join(top_bps) if top_bps else "-"))
         lines.append("")
-        lines.append(":white_check_mark: 특정 SKU 대량 출고 (Top)")
+
+        # 3) 특정 SKU 대량 출고
+        lines.append("✅ 특정 SKU 대량 출고 (Top)")
         if cust1_value == "해외B2B":
             lines.extend(_top_sku_with_bp_lines_overseas_split_stock(sub_cur, top_n_each=REPORT_TOP_N))
         else:
             top_skus = _top_sku_with_bp_lines(sub_cur, top_n=REPORT_TOP_N, bp_top_k=2)
             lines.extend(top_skus if top_skus else ["- 없음"])
         lines.append("")
-        lines.append(":white_check_mark: 전월 대비 주요 SKU 증감")
-        lines.append(f"- 증감률 Top{REPORT_TOP_N}")
+
+        # 4) 전월 대비 주요 SKU 증감
+        lines.append("✅ 전월 대비 주요 SKU 증감")
+        lines.append(f"  [증감률 Top{REPORT_TOP_N}]")
         pct_lines = _sku_mom_top_lines_by_pct(sub_cur, sub_prev, top_n=REPORT_TOP_N)
         lines.extend(["  " + x for x in pct_lines])
-        lines.append(f"- 증감수량 Top{REPORT_TOP_N}")
+        lines.append(f"  [증감수량 Top{REPORT_TOP_N}]")
         diff_lines = _sku_mom_top_lines_by_diff(sub_cur, sub_prev, top_n=REPORT_TOP_N)
         lines.extend(["  " + x for x in diff_lines])
         lines.append("")
-        lines.append(":white_check_mark: 전월 대비 출고량 증가 SKU")
+
+        # 5) 전월 대비 출고량 증가 SKU (급증)
+        lines.append("⚠️ 전월 대비 출고량 급증 SKU (+30% 이상)")
         lines.extend(_spike_sku_lines(sub_cur, sub_prev, top_n=REPORT_TOP_N))
         lines.append("")
-        lines.append(":spiral_calendar_pad: 차월 간략 일정(대량 출고 중심)")
+
+        # 6) 차월 간략 일정
+        lines.append("🗓️ 차월 간략 일정 (대량 출고 중심)")
         if next_df is None or next_df.empty:
             lines.append(f"- {title} 차월 데이터 없음")
             lines.append("")
@@ -1304,6 +1368,12 @@ if st.session_state["f_month"] != "전체":
 df_view = pool3.copy()
 if st.session_state["f_bp"] != "전체":
     df_view = df_view[df_view[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
+
+# ✅ v2.1 — pool2_with_bp: 월 필터 제외, 나머지 필터 적용 (③주차/④월간 비교용)
+pool2_with_bp = pool2.copy()
+if st.session_state["f_bp"] != "전체":
+    pool2_with_bp = pool2_with_bp[pool2_with_bp[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
+
 k = compute_kpis(df_view)
 st.markdown(
     f"""
@@ -1404,14 +1474,7 @@ elif nav == "② SKU별 조회":
 
     if ignore_month:
         # 월 필터만 빼고 나머지(거래처구분1/2, BP) 필터는 그대로 적용
-        base_sku = raw.copy()
-        if st.session_state["f_cust1"] != "전체":
-            base_sku = base_sku[base_sku[COL_CUST1].astype(str).str.strip() == st.session_state["f_cust1"]]
-        if st.session_state["f_cust2"] != "전체":
-            base_sku = base_sku[base_sku[COL_CUST2].astype(str).str.strip() == st.session_state["f_cust2"]]
-        if st.session_state["f_bp"] != "전체":
-            base_sku = base_sku[base_sku[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
-        d_sku = base_sku.copy()
+        d_sku = pool2_with_bp.copy()
         st.caption("⚠️ 월 필터를 무시하고 전체 기간을 조회 중입니다.")
     else:
         d_sku = df_view.copy()
@@ -1690,10 +1753,12 @@ elif nav == "② SKU별 조회":
 
 # =========================
 # ③ 주차요약
+# ✅ v2.1 — pool2_with_bp 사용으로 전주 비교 버그 수정
 # =========================
 elif nav == "③ 주차요약":
     st.subheader("주차요약")
-    d = df_view.copy()
+    # ✅ v2.1: 월 필터를 무시하고 전체 기간 사용 (전주 비교를 위해)
+    d = pool2_with_bp.copy()
     if d.empty:
         st.info("표시할 데이터가 없습니다.")
         st.stop()
@@ -1723,6 +1788,8 @@ elif nav == "③ 주차요약":
     render_numbered_block("주간 특이사항 (자동 코멘트)", comment_items)
     if prev_week:
         st.caption(f"※ 비교 기준: 선택 주차({sel_week}) vs 전주({prev_week})")
+    else:
+        st.caption("※ 사이드바 월 필터와 무관하게 전체 기간 내 주차를 비교합니다.")
     # ── 최근 12주 출고 추이 바 차트 ──
     st.divider()
     st.subheader("📊 최근 12주 출고 추이")
@@ -1760,10 +1827,12 @@ elif nav == "③ 주차요약":
         )
 # =========================
 # ④ 월간요약 (리포트 생성 포함)
+# ✅ v2.1 — pool2_with_bp 사용으로 전월 비교 버그 수정
 # =========================
 elif nav == "④ 월간요약":
     st.subheader("월간요약")
-    d = df_view.copy()
+    # ✅ v2.1: 월 필터를 무시하고 전체 기간 사용 (전월 비교를 위해)
+    d = pool2_with_bp.copy()
     if d.empty:
         st.info("표시할 데이터가 없습니다.")
         st.stop()
@@ -1777,7 +1846,15 @@ elif nav == "④ 월간요약":
     if not month_list:
         st.info("월 목록이 없습니다. RAW의 '년', '월1' 컬럼을 확인해 주세요.")
         st.stop()
-    sel_month = st.selectbox("월 선택", month_list, index=len(month_list) - 1, key="m_sel_month")
+
+    # ✅ v2.1: 사이드바 월 필터가 있으면 해당 월을 기본 선택값으로 설정
+    default_month_idx = len(month_list) - 1
+    if st.session_state.get("f_month", "전체") != "전체":
+        sidebar_month = st.session_state["f_month"]
+        if sidebar_month in month_list:
+            default_month_idx = month_list.index(sidebar_month)
+
+    sel_month = st.selectbox("월 선택", month_list, index=default_month_idx, key="m_sel_month")
     mdf = d[d["_month_label"].astype(str) == str(sel_month)].copy()
     cur_idx = month_list.index(sel_month) if sel_month in month_list else None
     prev_mdf = pd.DataFrame()
@@ -1798,6 +1875,8 @@ elif nav == "④ 월간요약":
     render_numbered_block("월간 특이사항 (자동 코멘트)", comment_items)
     if prev_month:
         st.caption(f"※ 비교 기준: 선택 월({sel_month}) vs 전월({prev_month})")
+    else:
+        st.caption("※ 사이드바 월 필터와 무관하게 전체 기간 내 월을 비교합니다.")
     # ── 월별 누적 바 차트 (해외B2B / 국내B2B) ──
     if "_ship_ym" in d.columns and COL_CUST1 in d.columns:
         m_chart_src = d.dropna(subset=["_ship_ym"]).copy()
@@ -1843,7 +1922,7 @@ elif nav == "④ 월간요약":
                 del st.session_state["monthly_report_text"]
             safe_rerun()
     if st.session_state.get("monthly_report_text", "").strip():
-        st.caption("아래 텍스트를 그대로 복사해서 내부 공유에 사용하세요.")
+        st.caption("아래 텍스트를 그대로 복사해서 슬랙/내부 공유에 사용하세요. (유니코드 이모지 적용)")
         st.text_area(
             "월간 공유용 리포트",
             value=st.session_state["monthly_report_text"],
@@ -1924,13 +2003,7 @@ elif nav == "⑦ 트렌드 분석":
     st.caption("※ 트렌드 분석은 월 필터를 무시하고 전체 기간 기준으로 표시됩니다. (거래처구분1/2, BP 필터는 반영)")
 
     # 트렌드용 베이스: 월 필터 제외, 나머지 필터 적용
-    trend_base = raw.copy()
-    if st.session_state["f_cust1"] != "전체":
-        trend_base = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == st.session_state["f_cust1"]]
-    if st.session_state["f_cust2"] != "전체":
-        trend_base = trend_base[trend_base[COL_CUST2].astype(str).str.strip() == st.session_state["f_cust2"]]
-    if st.session_state["f_bp"] != "전체":
-        trend_base = trend_base[trend_base[COL_BP].astype(str).str.strip() == st.session_state["f_bp"]]
+    trend_base = pool2_with_bp.copy()
 
     if trend_base.empty or "_ship_ym" not in trend_base.columns:
         st.info("표시할 데이터가 없습니다.")
