@@ -197,6 +197,20 @@ def uniq_sorted(df: pd.DataFrame, col: str):
     if df is None or df.empty or col not in df.columns:
         return []
     return sorted(df[col].dropna().astype(str).unique().tolist())
+
+def render_download_buttons(df: pd.DataFrame, filename_prefix: str, key_suffix: str = ""):
+    """CSV 다운로드 버튼 렌더링 (② SKU별 조회, ⑤ 국가별 조회, ⑥ BP명별 조회용)"""
+    if df is None or df.empty:
+        return
+    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 CSV 다운로드",
+        data=csv_data,
+        file_name=f"{filename_prefix}_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key=f"dl_csv_{filename_prefix}_{key_suffix}",
+    )
 def fmt_date(dtval) -> str:
     if pd.isna(dtval):
         return "-"
@@ -573,9 +587,9 @@ def build_shortage_alert(
     # spike 품목과 재고 데이터 조인
     alert = spike[[COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량", "현재_요청수량", "증가배수"]].copy()
     alert = alert.rename(columns={"이전_요청수량": "이전월출고", "현재_요청수량": "현재월출고"})
-    alert = alert.merge(inv_df[["품목코드", "현재고", "1차입고일", "1차입고수량"]], left_on=COL_ITEM_CODE, right_on="품목코드", how="left")
-    if "품목코드" in alert.columns and COL_ITEM_CODE in alert.columns:
-        alert = alert.drop(columns=["품목코드"], errors="ignore")
+    # inv_df의 컬럼명을 COL_ITEM_CODE와 통일 후 on= 으로 병합 (suffix 문제 방지)
+    inv_merge = inv_df.rename(columns={"품목코드": COL_ITEM_CODE})[[COL_ITEM_CODE, "현재고", "1차입고일", "1차입고수량"]].copy()
+    alert = alert.merge(inv_merge, on=COL_ITEM_CODE, how="left")
     alert = alert.merge(daily_avg[[COL_ITEM_CODE, "최근일평균출고"]], on=COL_ITEM_CODE, how="left")
     # 소진일수 계산
     alert["현재고"] = pd.to_numeric(alert["현재고"], errors="coerce").fillna(0)
@@ -979,6 +993,23 @@ def compute_weekly_summary_for_calendar(raw_df: pd.DataFrame, ym: str) -> dict:
                 avg_lt = float(lt_vals.mean())
         result[sunday] = {"avg_lt": avg_lt, "total_qty": total_qty, "ship_count": ship_count}
     return result
+def _sunday_to_week_label(sunday: date, cal_year: int = 0, cal_month: int = 0) -> str:
+    """일요일 날짜 → '2026년 6월 3주차' 형식 라벨 계산 (③주차요약 연동용)
+    캘린더 표시 월(cal_year/cal_month)이 주어지면 해당 월에 속하는 날짜 기준으로 계산"""
+    # 일요일~토요일 범위에서 캘린더 월에 속하는 날짜를 우선 사용
+    for offset in range(7):
+        d = sunday + timedelta(days=offset)
+        if cal_year > 0 and cal_month > 0:
+            if d.year == cal_year and d.month == cal_month:
+                wk = (d.day - 1) // 7 + 1
+                return f"{d.year}년 {d.month}월 {wk}주차"
+        else:
+            wk = (d.day - 1) // 7 + 1
+            return f"{d.year}년 {d.month}월 {wk}주차"
+    # fallback: 일요일 기준
+    wk = (sunday.day - 1) // 7 + 1
+    return f"{sunday.year}년 {sunday.month}월 {wk}주차"
+
 def _render_weekly_summary_html(ws: dict) -> str:
     """캘린더 주간요약 HTML 블록 생성 (중복 제거용 헬퍼)"""
     lt_str = f"{ws['avg_lt']:.1f}일" if ws['avg_lt'] is not None else "-"
@@ -1039,6 +1070,11 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str, raw_df: pd.Da
                         with st.container(border=True):
                             st.markdown("&nbsp;")
                             st.markdown(_render_weekly_summary_html(weekly_summary[wk_sunday]), unsafe_allow_html=True)
+                            wk_label = _sunday_to_week_label(wk_sunday, y, m)
+                            if wk_label and st.button("📊 주차요약 →", key=f"ws_nav_{wk_sunday}", use_container_width=True):
+                                st.session_state["nav_menu"] = "③ 주차요약"
+                                st.session_state["wk_sel_week"] = wk_label
+                                safe_rerun()
                     else:
                         st.container(border=True).markdown("&nbsp;")
                     continue
@@ -1052,6 +1088,11 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str, raw_df: pd.Da
                     # ── 일요일(i==0): 주간요약 표시 ──
                     if i == 0 and wk_sunday and wk_sunday in weekly_summary:
                         st.markdown(_render_weekly_summary_html(weekly_summary[wk_sunday]), unsafe_allow_html=True)
+                        wk_label = _sunday_to_week_label(wk_sunday, y, m)
+                        if wk_label and st.button("📊 주차요약 →", key=f"ws_nav_d_{wk_sunday}", use_container_width=True):
+                            st.session_state["nav_menu"] = "③ 주차요약"
+                            st.session_state["wk_sel_week"] = wk_label
+                            safe_rerun()
                     for idx in range(show_n):
                         e = events[idx]
                         bp = e.get("bp", "")
@@ -1910,6 +1951,7 @@ elif nav == "② SKU별 조회":
             wrap_cols=[COL_BP, "거래처구분1"],
             number_cols=["요청수량_합", "비율(%)"]
         )
+        render_download_buttons(bp_summary, f"SKU_{sel_code}_출고처별", key_suffix="sku_bp")
 
         # ── 월별 × BP명 채널 출고 현황 (피벗) ──
         if "_ship_ym" in sku_df.columns:
@@ -2000,6 +2042,7 @@ elif nav == "② SKU별 조회":
             wrap_cols=["월"],
             number_cols=["요청수량_합"]
         )
+        render_download_buttons(month_summary, f"SKU_{sel_code}_월별추이", key_suffix="sku_month")
         # 월별 바 차트
         if len(month_summary) > 1:
             chart_ms = month_summary.copy()
@@ -2075,6 +2118,37 @@ elif nav == "③ 주차요약":
         fig_wk.update_layout(height=340, margin=dict(l=0, r=0, t=40, b=0),
                               xaxis_tickangle=-30)
         st.plotly_chart(fig_wk, use_container_width=True)
+    # ── 상위 BP 3개 / 상위 SKU 3개 ──
+    st.divider()
+    wk_top_col1, wk_top_col2 = st.columns(2)
+    with wk_top_col1:
+        st.subheader("🏢 상위 BP Top3")
+        if wdf.empty or COL_BP not in wdf.columns or COL_QTY not in wdf.columns:
+            st.info("데이터가 없습니다.")
+        else:
+            bp_top3 = (
+                wdf.groupby(COL_BP, dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index()
+                .rename(columns={COL_QTY: "요청수량_합"})
+            )
+            bp_top3["요청수량_합"] = pd.to_numeric(bp_top3["요청수량_합"], errors="coerce").fillna(0).round(0).astype("Int64")
+            bp_top3 = bp_top3.sort_values("요청수량_합", ascending=False).head(3)
+            bp_top3.insert(0, "순위", range(1, len(bp_top3) + 1))
+            render_pretty_table(bp_top3, height=200, wrap_cols=[COL_BP], number_cols=["요청수량_합"])
+    with wk_top_col2:
+        st.subheader("📦 상위 SKU Top3")
+        if wdf.empty or not all(c in wdf.columns for c in [COL_ITEM_CODE, COL_ITEM_NAME, COL_QTY]):
+            st.info("데이터가 없습니다.")
+        else:
+            sku_top3 = (
+                wdf.groupby([COL_ITEM_CODE, COL_ITEM_NAME], dropna=False)[COL_QTY]
+                .sum(min_count=1).reset_index()
+                .rename(columns={COL_QTY: "요청수량_합"})
+            )
+            sku_top3["요청수량_합"] = pd.to_numeric(sku_top3["요청수량_합"], errors="coerce").fillna(0).round(0).astype("Int64")
+            sku_top3 = sku_top3.sort_values("요청수량_합", ascending=False).head(3)
+            sku_top3.insert(0, "순위", range(1, len(sku_top3) + 1))
+            render_pretty_table(sku_top3, height=200, wrap_cols=[COL_ITEM_NAME], number_cols=["요청수량_합"])
     st.divider()
     st.subheader("전주 대비 급증 SKU 리포트 (+30% 이상 증가)")
     if prev_week is None:
@@ -2228,6 +2302,7 @@ elif nav == "⑤ 국가별 조회":
     out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype("Int64")
     out = out.sort_values("요청수량_합", ascending=False, na_position="last")
     render_pretty_table(out, height=520, wrap_cols=[COL_CUST2], number_cols=["요청수량_합", "출고건수", "집계행수_표본"])
+    render_download_buttons(out, "국가별_조회", key_suffix="country")
     st.caption("※ P90은 '느린 상위 10%' 경계값(리드타임이 큰 구간)입니다.")
 # =========================
 # ⑥ BP명별 조회
@@ -2257,6 +2332,7 @@ elif nav == "⑥ BP명별 조회":
     out["집계행수_표본"] = pd.to_numeric(out["집계행수_표본"], errors="coerce").fillna(0).astype("Int64")
     out = out.sort_values("요청수량_합", ascending=False, na_position="last")
     render_pretty_table(out, height=520, wrap_cols=[COL_BP], number_cols=["요청수량_합", "출고건수", "집계행수_표본"])
+    render_download_buttons(out, "BP명별_조회", key_suffix="bp")
 # =========================
 # ⑦ 트렌드 분석
 # =========================
