@@ -1,44 +1,21 @@
 # ==========================================
-# B2B 출고 대시보드 (Google Sheet 기반)
-#
-# ✅ 새로고침 정책: 데이터/탭/화면/필터/리포트/내부상태 "모두 초기화"
-# ✅ 월간요약(④): 월간 리포트 생성(슬랙 공유용) 기능 포함
-#   - 신규업체: 전체 히스토리(선택 월 제외) 대비 신규
-#   - 해외 Top SKU: 공용재고 vs 전용재고(CN/EU/Mo/JP) 분리 (N1/N2/OFF 무시)
-#   - 전월 대비 주요 SKU 증감: "증감률 Top5" + "증감수량 Top5"
-#   - 리포트 내 Top 개수: 전부 Top5 고정
-#
-# ✅ 에러 수정(중요)
-# - _sku_mom_compare_table: pd.NA -> float 변환(TypeError) 방지
-#   => np.nan + 벡터화(np.where)로 변경
-#
-# ✅ ② SKU별 조회 추가
-# - 품목코드 검색(부분일치) → 품목코드/품목명/총 요청수량 KPI 카드
-# - 출고처(BP명)별 요청수량 합계 + 비율 테이블
-# - 월별 요청수량 추이 테이블
-# - 월 필터 무시 옵션(전체 기간 조회)
-#
-# ✅ v2.1 수정사항
-# - 이모지: Slack shortcode(:white_check_mark: 등) → 유니코드 이모지(✅ 등) 변환
-# - 버그수정: ③주차요약 / ④월간요약 — 사이드바 월 필터 적용 시
-#   전주/전월 비교 불가 버그 → pool2(월 필터 전) 기준으로 변경
-# - 리포트 직관성: 구매물류팀 관점 총괄 요약 섹션 추가,
-#   해외/국내 비율, 증감 방향 표시 강화
+# B2B 출고 대시보드 (Google Sheet 기반) — v2.2 optimized
+# 메뉴: ①출고캘린더 ②SKU별조회 ③주차요약 ④월간요약(리포트)
+#       ⑤국가별조회 ⑥BP명별조회 ⑦트렌드분석 ⑧부족예상재고
 # ==========================================
 import re
 import html
 import hashlib
 import calendar as pycal
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 import numpy as np
 import streamlit as st
 import pandas as pd
 try:
     import plotly.express as px
-    HAS_PLOTLY = True
 except ImportError:
-    HAS_PLOTLY = False
+    px = None
     st.warning("plotly 패키지가 없습니다. requirements.txt에 plotly를 추가해 주세요.", icon="⚠️")
 # =========================
 # 컬럼명 표준화 (RAW 기준)
@@ -71,7 +48,8 @@ REPORT_TOP_N = 5
 # Google Sheet 설정
 # =========================
 GSHEET_ID = "1jbWMgV3fudWCQ1qhG0lCysZGGFCo4loTIf-j3iuaqOI"
-GSHEET_GID = "15468212"
+GSHEET_GID = "15468212"       # SAP 탭
+GSHEET_GID_INV = "525131304"  # 상품카테고리&입고일 탭 (현재고/입고일)
 HEADER_ROW_0BASED = 6
 USECOLS = [
     COL_QTY, COL_YEAR, COL_MONTH,
@@ -167,12 +145,40 @@ table.pretty-table{
 }
 .comment{ margin: 0.08rem 0 0 0; line-height: 1.55; }
 .cal-note {color:#6b7280; font-size:0.9rem; margin-top:0.2rem;}
+.cal-week-summary {
+  background: linear-gradient(135deg, #e0f2fe 0%, #dbeafe 100%);
+  border: 1px solid #93c5fd;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.cal-week-summary .ws-title {
+  font-weight: 700;
+  color: #1e40af;
+  margin-bottom: 3px;
+  font-size: 0.8rem;
+}
+.cal-week-summary .ws-row {
+  display: flex;
+  justify-content: space-between;
+  color: #1e3a5f;
+}
+.cal-week-summary .ws-label { color: #475569; }
+.cal-week-summary .ws-val { font-weight: 600; font-variant-numeric: tabular-nums; }
 </style>
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 # =========================
 # Utils
 # =========================
+def _filter_cust1(df: pd.DataFrame, cust1_value: str) -> pd.DataFrame:
+    """거래처구분1 필터 헬퍼 — 반복 패턴 통합"""
+    if df is None or df.empty or COL_CUST1 not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    return df[df[COL_CUST1].astype(str).str.strip() == cust1_value]
+
 def make_btn_key(*parts) -> str:
     raw = "|".join([str(p) for p in parts])
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -484,6 +490,176 @@ def build_spike_report_only(cur_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.D
     spike = spike.sort_values("현재_요청수량", ascending=False, na_position="last")
     return spike[cols]
 # =========================
+# 재고 데이터 로드 (상품카테고리&입고일 탭)
+# =========================
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_inventory_from_gsheet() -> pd.DataFrame:
+    """상품카테고리&입고일 탭에서 현재고/입고일 데이터 로드 (H-M열)"""
+    csv_url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/export?format=csv&gid={GSHEET_GID_INV}"
+    try:
+        inv_raw = pd.read_csv(csv_url, header=1)
+    except Exception:
+        return pd.DataFrame(columns=["품목코드", "품목이름", "현재고", "1차입고일", "1차입고수량"])
+    # H-M열 = 인덱스 7~12 (0-based) — 실제 컬럼명으로 매핑
+    if inv_raw.shape[1] < 13:
+        return pd.DataFrame(columns=["품목코드", "품목이름", "현재고", "1차입고일", "1차입고수량"])
+    # H열(idx7)=품목 코드, I열(idx8)=품목 이름, J열(idx9)=현재고, K열(idx10)=1차 입고, L열(idx11)=1차 수량
+    inv = inv_raw.iloc[:, [7, 8, 9, 10, 11]].copy()
+    inv.columns = ["품목코드", "품목이름", "현재고", "1차입고일", "1차입고수량"]
+    # 빈 행 제거
+    inv = inv.dropna(subset=["품목코드"])
+    inv["품목코드"] = inv["품목코드"].astype(str).str.strip()
+    inv = inv[inv["품목코드"].str.len() > 0].copy()
+    # 숫자 변환
+    for c in ["현재고", "1차입고수량"]:
+        inv[c] = inv[c].astype(str).str.replace(",", "", regex=False).str.strip()
+        inv[c] = pd.to_numeric(inv[c], errors="coerce").fillna(0)
+    # 날짜 변환
+    inv["1차입고일"] = pd.to_datetime(inv["1차입고일"], errors="coerce")
+    return inv
+# =========================
+# 부족 예상 재고 알람 분석
+# =========================
+def build_shortage_alert(
+    raw_df: pd.DataFrame,
+    inv_df: pd.DataFrame,
+    lookback_days: int = 90,
+    alert_threshold_days: int = 30,
+) -> pd.DataFrame:
+    """
+    30%+ 증가 품목을 대상으로 재고 소진일수를 계산하여 부족 예상 알람 생성.
+    - 소진일수 = 현재고 / 최근 일평균출고량
+    - alert_threshold_days 이하이면 알람 대상
+    """
+    cols_out = [
+        COL_ITEM_CODE, COL_ITEM_NAME, "현재고", "최근일평균출고",
+        "소진예상일수", "소진예상일", "1차입고일", "1차입고수량",
+        "입고전소진여부", "위험등급", "이전월출고", "현재월출고", "증가배수",
+    ]
+    if raw_df is None or raw_df.empty or inv_df is None or inv_df.empty:
+        return pd.DataFrame(columns=cols_out)
+    # 해외B2B만 필터
+    overseas = _filter_cust1(raw_df, LT_ONLY_CUST1).copy()
+    if overseas.empty:
+        return pd.DataFrame(columns=cols_out)
+    # 현재월/이전월 기준 설정
+    today = date.today()
+    cur_ym = today.strftime("%Y-%m")
+    prev_month = today.replace(day=1) - timedelta(days=1)
+    prev_ym = prev_month.strftime("%Y-%m")
+    # 월별 출고 집계
+    if "_ship_ym" not in overseas.columns:
+        return pd.DataFrame(columns=cols_out)
+    cur_data = overseas[overseas["_ship_ym"].astype(str) == cur_ym]
+    prev_data = overseas[overseas["_ship_ym"].astype(str) == prev_ym]
+    # 30% 이상 증가 품목 탐지 (기존 spike 로직 활용)
+    spike = build_spike_report_only(cur_data, prev_data)
+    if spike.empty:
+        return pd.DataFrame(columns=cols_out)
+    # 최근 N일 일평균 출고량 계산
+    cutoff = today - timedelta(days=lookback_days)
+    ship_dates = pd.to_datetime(overseas["_ship_date"], errors="coerce")
+    recent = overseas[ship_dates.notna() & (ship_dates >= pd.Timestamp(cutoff))].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=cols_out)
+    daily_avg = (
+        recent.groupby(COL_ITEM_CODE, dropna=False)[COL_QTY]
+        .sum()
+        .reset_index(name="_total_qty")
+    )
+    daily_avg["_total_qty"] = pd.to_numeric(daily_avg["_total_qty"], errors="coerce").fillna(0)
+    actual_days = max((today - cutoff).days, 1)
+    daily_avg["최근일평균출고"] = (daily_avg["_total_qty"] / actual_days).round(1)
+    # spike 품목과 재고 데이터 조인
+    alert = spike[[COL_ITEM_CODE, COL_ITEM_NAME, "이전_요청수량", "현재_요청수량", "증가배수"]].copy()
+    alert = alert.rename(columns={"이전_요청수량": "이전월출고", "현재_요청수량": "현재월출고"})
+    alert = alert.merge(inv_df[["품목코드", "현재고", "1차입고일", "1차입고수량"]], left_on=COL_ITEM_CODE, right_on="품목코드", how="left")
+    if "품목코드" in alert.columns and COL_ITEM_CODE in alert.columns:
+        alert = alert.drop(columns=["품목코드"], errors="ignore")
+    alert = alert.merge(daily_avg[[COL_ITEM_CODE, "최근일평균출고"]], on=COL_ITEM_CODE, how="left")
+    # 소진일수 계산
+    alert["현재고"] = pd.to_numeric(alert["현재고"], errors="coerce").fillna(0)
+    alert["최근일평균출고"] = pd.to_numeric(alert["최근일평균출고"], errors="coerce").fillna(0)
+    alert["소진예상일수"] = alert.apply(
+        lambda r: round(r["현재고"] / r["최근일평균출고"], 1) if r["최근일평균출고"] > 0 else float("inf"),
+        axis=1,
+    )
+    alert["소진예상일"] = alert["소진예상일수"].apply(
+        lambda d: (today + timedelta(days=int(d))).strftime("%Y-%m-%d") if d != float("inf") and d < 365 else "-"
+    )
+    # 입고 전 소진 여부
+    alert["입고전소진여부"] = alert.apply(
+        lambda r: (
+            "예" if (
+                pd.notna(r.get("1차입고일")) and r["소진예상일"] != "-"
+                and pd.to_datetime(r["소진예상일"], errors="coerce") is not pd.NaT
+                and pd.to_datetime(r["소진예상일"], errors="coerce") < r["1차입고일"]
+            ) else ("입고예정없음" if pd.isna(r.get("1차입고일")) else "아니오")
+        ),
+        axis=1,
+    )
+    # 위험등급 분류
+    def _risk_level(r):
+        days = r["소진예상일수"]
+        if days == float("inf"):
+            return "안전"
+        if days <= 7:
+            return "긴급"
+        if days <= 14:
+            return "위험"
+        if days <= alert_threshold_days:
+            return "주의"
+        return "안전"
+    alert["위험등급"] = alert.apply(_risk_level, axis=1)
+    # 안전 등급 제외하고 위험도순 정렬
+    risk_order = {"긴급": 0, "위험": 1, "주의": 2, "안전": 3}
+    alert["_risk_sort"] = alert["위험등급"].map(risk_order)
+    alert = alert.sort_values(["_risk_sort", "소진예상일수"], ascending=[True, True])
+    alert = alert.drop(columns=["_risk_sort"], errors="ignore")
+    # 유효 컬럼만 반환
+    for c in cols_out:
+        if c not in alert.columns:
+            alert[c] = pd.NA
+    return alert[cols_out]
+# =========================
+# Slack 메시지 포맷 (부족 예상 재고)
+# =========================
+def build_shortage_slack_message(alert_df: pd.DataFrame) -> str:
+    """부족 예상 재고 알람 데이터를 Slack 메시지 포맷으로 변환"""
+    if alert_df is None or alert_df.empty:
+        return "부족 예상 재고 알람: 현재 알람 대상 품목이 없습니다."
+    today_str = date.today().strftime("%Y-%m-%d")
+    lines = [f"{'='*40}", f"부족 예상 재고 알람 ({today_str})", f"{'='*40}", ""]
+    # 위험등급별 그룹핑
+    for grade in ["긴급", "위험", "주의"]:
+        sub = alert_df[alert_df["위험등급"] == grade]
+        if sub.empty:
+            continue
+        emoji = {"긴급": "🔴", "위험": "🟠", "주의": "🟡"}.get(grade, "⚪")
+        lines.append(f"{emoji} [{grade}] {len(sub)}건")
+        lines.append("-" * 30)
+        for _, r in sub.iterrows():
+            code = str(r.get(COL_ITEM_CODE, ""))
+            name = str(r.get(COL_ITEM_NAME, ""))
+            stock = int(r.get("현재고", 0))
+            days = r.get("소진예상일수", float("inf"))
+            days_str = f"{days:.0f}일" if days != float("inf") else "-"
+            depl = str(r.get("소진예상일", "-"))
+            inc_date = r.get("1차입고일")
+            inc_str = inc_date.strftime("%m/%d") if pd.notna(inc_date) else "미정"
+            inc_qty = int(r.get("1차입고수량", 0))
+            before = str(r.get("입고전소진여부", "-"))
+            rate = r.get("증가배수", pd.NA)
+            rate_str = f"x{rate:.1f}" if pd.notna(rate) else "-"
+            lines.append(f"  {code} | {name[:20]}")
+            lines.append(f"    현재고: {stock:,} | 소진예상: {days_str} ({depl})")
+            lines.append(f"    입고: {inc_str} ({inc_qty:,}개) | 입고전소진: {before}")
+            lines.append(f"    월간증가: {rate_str}")
+            lines.append("")
+    total = len(alert_df[alert_df["위험등급"] != "안전"])
+    lines.append(f"총 {total}건 알람 | 기준: 최근90일 평균출고 기반")
+    return "\n".join(lines)
+# =========================
 # 주차/월간 자동 코멘트 helpers
 # =========================
 def _delta_arrow(diff: float) -> str:
@@ -510,10 +686,8 @@ def _get_order_cnt(df: pd.DataFrame) -> int:
     if df is None or df.empty or COL_ORDER_NO not in df.columns:
         return 0
     return _clean_nunique(df[COL_ORDER_NO])
-def _get_ship_cnt(df: pd.DataFrame) -> int:
-    if df is None or df.empty or COL_ORDER_NO not in df.columns:
-        return 0
-    return _clean_nunique(df[COL_ORDER_NO])
+# _get_ship_cnt는 _get_order_cnt와 동일 로직이므로 별칭으로 통합
+_get_ship_cnt = _get_order_cnt
 def _get_qty(df: pd.DataFrame) -> int:
     if df is None or df.empty or COL_QTY not in df.columns:
         return 0
@@ -668,7 +842,7 @@ def compute_kpis(df_view: pd.DataFrame):
     latest_done = df_view[COL_DONE].max() if (df_view is not None and COL_DONE in df_view.columns) else pd.NaT
     avg_lt2_overseas = None
     if df_view is not None and all(c in df_view.columns for c in [COL_CUST1, COL_LT2]):
-        overseas = df_view[df_view[COL_CUST1].astype(str).str.strip() == LT_ONLY_CUST1]
+        overseas = _filter_cust1(df_view, LT_ONLY_CUST1)
         if not overseas.empty and not overseas[COL_LT2].dropna().empty:
             avg_lt2_overseas = float(overseas[COL_LT2].dropna().mean())
     top_bp_qty_name = "-"
@@ -754,7 +928,72 @@ def build_day_map_from_cal_agg(cal_agg: pd.DataFrame, ym: str) -> dict[date, lis
             for _, r in grp.iterrows()
         ]
     return out
-def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
+# =========================
+# Weekly summary for calendar (해외B2B)
+# =========================
+def compute_weekly_summary_for_calendar(raw_df: pd.DataFrame, ym: str) -> dict:
+    """해외B2B 주간 평균 리드타임 + 출고수량을 계산하여 {sunday_date: {avg_lt, total_qty, ship_count}} 형태로 반환"""
+    if raw_df is None or raw_df.empty:
+        return {}
+    y, m = ym_to_year_month(ym)
+    # 해외B2B만 필터
+    overseas = _filter_cust1(raw_df, LT_ONLY_CUST1).copy()
+    if overseas.empty:
+        return {}
+    # 출고일자 기준 필터
+    if "_ship_date" not in overseas.columns:
+        return {}
+    overseas = overseas.dropna(subset=["_ship_date"])
+    if overseas.empty:
+        return {}
+    # 캘린더 주차 구성 (일요일 시작)
+    cal = pycal.Calendar(firstweekday=6)
+    weeks = cal.monthdayscalendar(y, m)
+    result = {}
+    for wk in weeks:
+        # 주의 실제 날짜 범위 계산
+        non_zero = [(pos, day_num) for pos, day_num in enumerate(wk) if day_num > 0]
+        if not non_zero:
+            continue
+        pos0, day0 = non_zero[0]
+        ref_date = date(y, m, day0)
+        sunday = ref_date - timedelta(days=pos0)
+        saturday = sunday + timedelta(days=6)
+        # 해당 주 데이터 필터
+        wk_data = overseas[
+            (overseas["_ship_date"] >= sunday) &
+            (overseas["_ship_date"] <= saturday)
+        ]
+        if wk_data.empty:
+            result[sunday] = {"avg_lt": None, "total_qty": 0, "ship_count": 0}
+            continue
+        # 출고수량 합계
+        total_qty = float(pd.to_numeric(wk_data[COL_QTY], errors="coerce").fillna(0).sum())
+        # 출고 건수 (BP 기준 고유 건수)
+        ship_count = int(wk_data[COL_BP].nunique()) if COL_BP in wk_data.columns else 0
+        # 평균 리드타임 (COL_LT2)
+        avg_lt = None
+        if COL_LT2 in wk_data.columns:
+            lt_vals = pd.to_numeric(wk_data[COL_LT2], errors="coerce").dropna()
+            if not lt_vals.empty:
+                avg_lt = float(lt_vals.mean())
+        result[sunday] = {"avg_lt": avg_lt, "total_qty": total_qty, "ship_count": ship_count}
+    return result
+def _render_weekly_summary_html(ws: dict) -> str:
+    """캘린더 주간요약 HTML 블록 생성 (중복 제거용 헬퍼)"""
+    lt_str = f"{ws['avg_lt']:.1f}일" if ws['avg_lt'] is not None else "-"
+    qty_str = f"{ws['total_qty']:,.0f}" if ws['total_qty'] else "0"
+    bp_str = f"{ws['ship_count']}개사" if ws['ship_count'] else "-"
+    return (
+        '<div class="cal-week-summary">'
+        '<div class="ws-title">✈ 해외B2B 주간</div>'
+        f'<div class="ws-row"><span class="ws-label">평균 LT</span><span class="ws-val">{lt_str}</span></div>'
+        f'<div class="ws-row"><span class="ws-label">출고수량</span><span class="ws-val">{qty_str}</span></div>'
+        f'<div class="ws-row"><span class="ws-label">거래처</span><span class="ws-val">{bp_str}</span></div>'
+        '</div>'
+    )
+
+def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str, raw_df: pd.DataFrame = None):
     y, m = ym_to_year_month(ym)
     day_map = build_day_map_from_cal_agg(cal_agg_filtered, ym)
     prev_ym = add_months(ym, -1)
@@ -778,15 +1017,30 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
     for i, w in enumerate(weekdays):
         with header_cols[i]:
             st.markdown(f"**{w}**")
+    # ── 해외B2B 주간 요약 계산 ──
+    weekly_summary = compute_weekly_summary_for_calendar(raw_df, ym) if raw_df is not None else {}
     cal = pycal.Calendar(firstweekday=6)
     weeks = cal.monthdayscalendar(y, m)
     expanded: set[date] = st.session_state.get("cal_expanded", set())
     for wk in weeks:
+        # 해당 주의 일요일 날짜 계산 (주간요약 매핑용)
+        wk_sunday = None
+        non_zero = [(pos, dn) for pos, dn in enumerate(wk) if dn > 0]
+        if non_zero:
+            pos0, day0 = non_zero[0]
+            ref_d = date(y, m, day0)
+            wk_sunday = ref_d - timedelta(days=pos0)
         cols = st.columns(7, gap="small")
         for i, day_num in enumerate(wk):
             with cols[i]:
                 if day_num == 0:
-                    st.container(border=True).markdown("&nbsp;")
+                    # ── 일요일(i==0)이고 빈 셀이지만 주간요약은 표시 ──
+                    if i == 0 and wk_sunday and wk_sunday in weekly_summary:
+                        with st.container(border=True):
+                            st.markdown("&nbsp;")
+                            st.markdown(_render_weekly_summary_html(weekly_summary[wk_sunday]), unsafe_allow_html=True)
+                    else:
+                        st.container(border=True).markdown("&nbsp;")
                     continue
                 d = date(y, m, day_num)
                 events = day_map.get(d, [])
@@ -795,6 +1049,9 @@ def render_month_calendar(cal_agg_filtered: pd.DataFrame, ym: str):
                 hidden = max(0, len(events) - show_n)
                 with st.container(border=True):
                     st.markdown(f"**{day_num}**")
+                    # ── 일요일(i==0): 주간요약 표시 ──
+                    if i == 0 and wk_sunday and wk_sunday in weekly_summary:
+                        st.markdown(_render_weekly_summary_html(weekly_summary[wk_sunday]), unsafe_allow_html=True)
                     for idx in range(show_n):
                         e = events[idx]
                         bp = e.get("bp", "")
@@ -983,8 +1240,7 @@ def _extract_overseas_country(name: str) -> str:
         return "공용"
     m = re.search(r"\b(CN|EU|MO|JP|Mo)\b", s, flags=re.IGNORECASE)
     if m:
-        code = m.group(1).upper()
-        return code if code != "MO" else "MO"
+        return m.group(1).upper()
     return "공용"
 def _new_bp_detail_lines_whole_history(
     all_df: pd.DataFrame,
@@ -995,7 +1251,7 @@ def _new_bp_detail_lines_whole_history(
 ) -> list[str]:
     if cur_df is None or cur_df.empty or COL_BP not in cur_df.columns:
         return ["- 없음"]
-    cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy()
+    cur = _filter_cust1(cur_df, cust1_value).copy()
     if cur.empty:
         return ["- 없음"]
     cur["__bp"] = cur[COL_BP].astype(str).str.strip()
@@ -1005,7 +1261,7 @@ def _new_bp_detail_lines_whole_history(
     others = all_df.copy()
     if "_month_label" in others.columns:
         others = others[others["_month_label"].astype(str) != str(cur_month_label)].copy()
-    others = others[others[COL_CUST1].astype(str).str.strip() == cust1_value].copy()
+    others = _filter_cust1(others, cust1_value).copy()
     other_bps = set(others[COL_BP].dropna().astype(str).str.strip().tolist()) if not others.empty else set()
     new_cur = cur[~cur["__bp"].isin(other_bps)].copy()
     if new_cur.empty:
@@ -1178,10 +1434,10 @@ def build_monthly_share_report(
     # ── 총괄 수치 산출 ──
     total_cur_qty = _sum_qty(cur_df)
     total_prev_qty = _sum_qty(prev_df)
-    overseas_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == "해외B2B"] if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
-    domestic_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == "국내B2B"] if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
-    overseas_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == "해외B2B"] if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
-    domestic_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == "국내B2B"] if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
+    overseas_cur = _filter_cust1(cur_df, "해외B2B") if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
+    domestic_cur = _filter_cust1(cur_df, "국내B2B") if (cur_df is not None and not cur_df.empty) else pd.DataFrame()
+    overseas_prev = _filter_cust1(prev_df, "해외B2B") if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
+    domestic_prev = _filter_cust1(prev_df, "국내B2B") if (prev_df is not None and not prev_df.empty) else pd.DataFrame()
 
     ovs_cur_qty = _sum_qty(overseas_cur)
     ovs_prev_qty = _sum_qty(overseas_prev)
@@ -1206,8 +1462,8 @@ def build_monthly_share_report(
     ]
 
     def section_for(cust1_value: str, title: str, sched_top_bp_n: int):
-        sub_cur = cur_df[cur_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy()
-        sub_prev = prev_df[prev_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy() if (prev_df is not None) else pd.DataFrame()
+        sub_cur = _filter_cust1(cur_df, cust1_value).copy()
+        sub_prev = _filter_cust1(prev_df, cust1_value).copy() if (prev_df is not None) else pd.DataFrame()
         lines: list[str] = []
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"*{title}*")
@@ -1270,7 +1526,7 @@ def build_monthly_share_report(
             lines.append(f"- {title} 차월 데이터 없음")
             lines.append("")
             return lines
-        sub_next = next_df[next_df[COL_CUST1].astype(str).str.strip() == cust1_value].copy()
+        sub_next = _filter_cust1(next_df, cust1_value).copy()
         if sub_next.empty:
             lines.append(f"- {title} 차월 데이터 없음")
             lines.append("")
@@ -1322,6 +1578,12 @@ with st.spinner("Google Sheet RAW 로딩/전처리 중..."):
         st.error("Google Sheet에서 RAW 데이터를 불러오지 못했습니다.")
         st.code(str(e))
         st.stop()
+# 재고 데이터 로드 (상품카테고리&입고일 탭)
+with st.spinner("재고/입고 데이터 로딩 중..."):
+    try:
+        inv_data = load_inventory_from_gsheet()
+    except Exception:
+        inv_data = pd.DataFrame(columns=["품목코드", "품목이름", "현재고", "1차입고일", "1차입고수량"])
 # =========================
 # Sidebar filters
 # =========================
@@ -1415,7 +1677,7 @@ st.divider()
 # =========================
 nav = st.radio(
     "메뉴",
-    ["① 출고 캘린더", "② SKU별 조회", "③ 주차요약", "④ 월간요약", "⑤ 국가별 조회", "⑥ BP명별 조회", "⑦ 트렌드 분석"],
+    ["① 출고 캘린더", "② SKU별 조회", "③ 주차요약", "④ 월간요약", "⑤ 국가별 조회", "⑥ BP명별 조회", "⑦ 트렌드 분석", "⑧ 부족예상재고"],
     horizontal=True,
     key="nav_menu"
 )
@@ -1454,7 +1716,7 @@ if nav == "① 출고 캘린더":
             render_calendar_detail(raw, sel_date, sel_bp)
     else:
         st.subheader("출고 캘린더 (월별)")
-        render_month_calendar(cal_pool, ym)
+        render_month_calendar(cal_pool, ym, raw_df=raw)
 # =========================
 # ② SKU별 조회
 # =========================
@@ -2054,7 +2316,7 @@ elif nav == "⑦ 트렌드 분석":
     tab_s2_ovs, tab_s2_dom = st.tabs(["🟦 해외B2B", "🟩 국내B2B"])
     for _tab2, _cust1_2 in [(tab_s2_ovs, "해외B2B"), (tab_s2_dom, "국내B2B")]:
         with _tab2:
-            sub2 = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == _cust1_2].copy()
+            sub2 = _filter_cust1(trend_base, _cust1_2).copy()
             if sub2.empty:
                 st.info(f"{_cust1_2} 데이터가 없습니다.")
                 continue
@@ -2094,7 +2356,7 @@ elif nav == "⑦ 트렌드 분석":
     tab_s3_ovs, tab_s3_dom = st.tabs(["🟦 해외B2B (JP/CN/EU/MO/공용 구분)", "🟩 국내B2B"])
 
     with tab_s3_ovs:
-        sub3_o = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == "해외B2B"].copy()
+        sub3_o = _filter_cust1(trend_base, "해외B2B").copy()
         if sub3_o.empty:
             st.info("해외B2B 데이터가 없습니다.")
         else:
@@ -2150,7 +2412,7 @@ elif nav == "⑦ 트렌드 분석":
                     st.plotly_chart(fig3_o2, use_container_width=True)
 
     with tab_s3_dom:
-        sub3_d = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == "국내B2B"].copy()
+        sub3_d = _filter_cust1(trend_base, "국내B2B").copy()
         if sub3_d.empty:
             st.info("국내B2B 데이터가 없습니다.")
         else:
@@ -2208,7 +2470,7 @@ elif nav == "⑦ 트렌드 분석":
     tab_s4_ovs, tab_s4_dom = st.tabs(["🟦 해외B2B", "🟩 국내B2B"])
     for _tab4, _cust1_4 in [(tab_s4_ovs, "해외B2B"), (tab_s4_dom, "국내B2B")]:
         with _tab4:
-            sub4 = trend_base[trend_base[COL_CUST1].astype(str).str.strip() == _cust1_4].copy()
+            sub4 = _filter_cust1(trend_base, _cust1_4).copy()
             if sub4.empty:
                 st.info(f"{_cust1_4} 데이터가 없습니다.")
                 continue
@@ -2247,5 +2509,123 @@ elif nav == "⑦ 트렌드 분석":
             )
             st.plotly_chart(fig4, use_container_width=True)
             st.caption(f"※ Top3 BP: {' / '.join(top3_bps)}")
+
+# =========================
+# ⑧ 부족 예상 재고
+# =========================
+elif nav == "⑧ 부족예상재고":
+    st.subheader("⑧ 부족 예상 재고 알람 (해외B2B)")
+    st.caption("※ 해외B2B 기준 | 전월 대비 30% 이상 출고 증가 품목 대상 | 최근 90일 평균출고 기반 소진일수 산출")
+
+    if inv_data.empty:
+        st.warning("재고/입고 데이터를 불러올 수 없습니다. (상품카테고리&입고일 탭 확인 필요)")
+    else:
+        # 설정 옵션
+        with st.expander("분석 설정", expanded=False):
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                lookback = st.slider("일평균 출고 계산 기간 (일)", 30, 180, 90, step=10, key="shortage_lookback")
+            with col_s2:
+                threshold = st.slider("알람 기준 소진일수 (일)", 7, 60, 30, step=7, key="shortage_threshold")
+
+        # 알람 분석 실행
+        alert_result = build_shortage_alert(raw, inv_data, lookback_days=lookback, alert_threshold_days=threshold)
+
+        # 요약 KPI
+        if alert_result.empty or alert_result[alert_result["위험등급"] != "안전"].empty:
+            st.success("현재 부족 예상 알람 대상 품목이 없습니다.")
+        else:
+            alert_active = alert_result[alert_result["위험등급"] != "안전"]
+            n_urgent = len(alert_active[alert_active["위험등급"] == "긴급"])
+            n_warn = len(alert_active[alert_active["위험등급"] == "위험"])
+            n_caution = len(alert_active[alert_active["위험등급"] == "주의"])
+
+            kpi_cols = st.columns(4)
+            with kpi_cols[0]:
+                st.metric("총 알람 품목", f"{len(alert_active)}건")
+            with kpi_cols[1]:
+                st.metric("🔴 긴급 (7일 이내)", f"{n_urgent}건")
+            with kpi_cols[2]:
+                st.metric("🟠 위험 (14일 이내)", f"{n_warn}건")
+            with kpi_cols[3]:
+                st.metric("🟡 주의 (30일 이내)", f"{n_caution}건")
+
+            st.divider()
+
+            # 위험등급별 탭 표시
+            tab_all, tab_urgent, tab_warn, tab_caution = st.tabs(["전체", "🔴 긴급", "🟠 위험", "🟡 주의"])
+
+            def _render_alert_table(df_sub):
+                if df_sub.empty:
+                    st.info("해당 등급의 알람 품목이 없습니다.")
+                    return
+                display_df = df_sub.copy()
+                # 포맷팅
+                display_df["현재고"] = display_df["현재고"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "-")
+                display_df["최근일평균출고"] = display_df["최근일평균출고"].apply(lambda x: f"{x:,.1f}" if pd.notna(x) else "-")
+                display_df["소진예상일수"] = display_df["소진예상일수"].apply(lambda x: f"{x:.0f}일" if x != float("inf") else "-")
+                display_df["이전월출고"] = display_df["이전월출고"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "-")
+                display_df["현재월출고"] = display_df["현재월출고"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "-")
+                display_df["증가배수"] = display_df["증가배수"].apply(lambda x: f"x{x:.1f}" if pd.notna(x) else "-")
+                display_df["1차입고일"] = display_df["1차입고일"].apply(lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) else "미정")
+                display_df["1차입고수량"] = display_df["1차입고수량"].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x > 0 else "-")
+                display_cols = [
+                    COL_ITEM_CODE, COL_ITEM_NAME, "위험등급", "현재고", "최근일평균출고",
+                    "소진예상일수", "소진예상일", "1차입고일", "1차입고수량",
+                    "입고전소진여부", "이전월출고", "현재월출고", "증가배수",
+                ]
+                display_df = display_df[[c for c in display_cols if c in display_df.columns]]
+                # 위험등급 색상 표시
+                def _color_risk(val):
+                    if val == "긴급":
+                        return "background-color: #fee2e2; color: #991b1b; font-weight: bold;"
+                    elif val == "위험":
+                        return "background-color: #ffedd5; color: #9a3412; font-weight: bold;"
+                    elif val == "주의":
+                        return "background-color: #fef9c3; color: #854d0e; font-weight: bold;"
+                    return ""
+                # applymap deprecated (pandas 2.1+) → map 사용
+                _style_fn = getattr(display_df.style, "map", None) or display_df.style.applymap
+                styled = _style_fn(_color_risk, subset=["위험등급"] if "위험등급" in display_df.columns else [])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            with tab_all:
+                _render_alert_table(alert_active)
+            with tab_urgent:
+                _render_alert_table(alert_active[alert_active["위험등급"] == "긴급"])
+            with tab_warn:
+                _render_alert_table(alert_active[alert_active["위험등급"] == "위험"])
+            with tab_caution:
+                _render_alert_table(alert_active[alert_active["위험등급"] == "주의"])
+
+            st.divider()
+
+            # Slack 공유 기능
+            st.subheader("Slack 공유")
+            slack_msg = build_shortage_slack_message(alert_active)
+            with st.expander("Slack 메시지 미리보기", expanded=False):
+                st.code(slack_msg, language=None)
+            col_copy, col_info = st.columns([1, 2])
+            with col_copy:
+                st.download_button(
+                    "📋 Slack 메시지 다운로드",
+                    data=slack_msg,
+                    file_name=f"shortage_alert_{date.today().strftime('%Y%m%d')}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            with col_info:
+                st.caption("다운로드한 텍스트를 Slack 채널에 붙여넣기 하세요.")
+
+        # 재고 현황 전체 테이블 (참고용)
+        with st.expander("📦 전체 재고 현황 (상품카테고리&입고일 탭)", expanded=False):
+            if not inv_data.empty:
+                inv_display = inv_data.copy()
+                inv_display["현재고"] = inv_display["현재고"].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x > 0 else "0")
+                inv_display["1차입고일"] = inv_display["1차입고일"].apply(lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) else "-")
+                inv_display["1차입고수량"] = inv_display["1차입고수량"].apply(lambda x: f"{int(x):,}" if pd.notna(x) and x > 0 else "-")
+                st.dataframe(inv_display, use_container_width=True, hide_index=True)
+            else:
+                st.info("재고 데이터가 없습니다.")
 
 st.caption("※ 모든 집계는 Google Sheet RAW 기반이며, 제품분류(B0/B1) 고정 + 선택한 필터 범위 내에서 계산됩니다.")
